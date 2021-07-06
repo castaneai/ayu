@@ -1,0 +1,29 @@
+package ayu
+
+import "context"
+
+type Authenticator interface {
+	Authenticate(ctx context.Context, req *AuthnRequest) (*AuthnResponse, error)
+}
+
+type AuthnRequest struct {
+	RoomID        RoomID
+	ClientID      ClientID
+	ConnectionID  ConnectionID
+	AuthnMetadata map[string]interface{}
+}
+
+type AuthnResponse struct {
+	Allowed       bool
+	Reason        string
+	ICEServers    []*ICEServer
+	AuthzMetadata map[string]interface{}
+}
+
+type NopAuthenticator struct{}
+
+func (a *NopAuthenticator) Authenticate(ctx context.Context, req *AuthnRequest) (*AuthnResponse, error) {
+	return &AuthnResponse{
+		Allowed: true,
+	}, nil
+}
