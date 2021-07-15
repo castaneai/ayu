@@ -37,6 +37,24 @@ type ServerOption interface {
 	apply(opts *serverOptions)
 }
 
+type ServerOptionFunc func(opts *serverOptions)
+
+func (f ServerOptionFunc) apply(opts *serverOptions) {
+	f(opts)
+}
+
+func WithAuthenticator(authn Authenticator) ServerOption {
+	return ServerOptionFunc(func(opts *serverOptions) {
+		opts.authn = authn
+	})
+}
+
+func WithLogger(logger Logger) ServerOption {
+	return ServerOptionFunc(func(opts *serverOptions) {
+		opts.logger = logger
+	})
+}
+
 type serverOptions struct {
 	readTimeout  time.Duration
 	writeTimeout time.Duration
@@ -120,6 +138,7 @@ func (s *Server) handle(conn *websocket.Conn) {
 		case <-disconnectedCh:
 			return
 		case <-pongTimeoutCh:
+			s.logger.Warnf("pong timeout(%v)", s.opts.pongTimeout)
 			return
 		case <-leaveCh:
 			return
@@ -282,7 +301,6 @@ func (s *Server) startPingPong(client *clientProxy, pongCh <-chan *PingPongMessa
 			case <-pongCh:
 				resetTimer(pongTimeoutTimer, s.opts.pongTimeout)
 			case <-pongTimeoutTimer.C:
-				s.logger.Warnf("pong timeout(%v)", s.opts.pongTimeout)
 				close(pongTimeoutCh)
 				return
 			}
