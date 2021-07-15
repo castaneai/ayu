@@ -10,7 +10,7 @@ ayu is WebRTC Signaling Server with [ayame](https://github.com/OpenAyame/ayame)-
 ## Usage
 
 In the following example, `ws://localhost:8080/signaling` will be the endpoint of the signaling server.
-Please see [ayame-spec](https://github.com/OpenAyame/ayame-spec) for mode details on the protocol.
+Please see [ayame-spec](https://github.com/OpenAyame/ayame-spec) for more details on the protocol.
 
 ```go
 package main
