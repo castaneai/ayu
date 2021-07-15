@@ -1,6 +1,8 @@
 package ayu
 
-import "context"
+import (
+	"context"
+)
 
 type Authenticator interface {
 	Authenticate(ctx context.Context, req *AuthnRequest) (*AuthnResponse, error)
@@ -25,5 +27,12 @@ type NopAuthenticator struct{}
 func (a *NopAuthenticator) Authenticate(ctx context.Context, req *AuthnRequest) (*AuthnResponse, error) {
 	return &AuthnResponse{
 		Allowed: true,
+		ICEServers: []*ICEServer{
+			{
+				URLs: []string{
+					"stun:stun.l.google.com:19302",
+				},
+			},
+		},
 	}, nil
 }
