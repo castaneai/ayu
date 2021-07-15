@@ -1,9 +1,7 @@
-up:
-	docker-compose up -d
-
 test:
-	make up
+	docker-compose up -d
 	go test -count=1 -race ./...
+	docker-compose down
 
 monitor-redis:
 	docker-compose exec redis redis-cli monitor
