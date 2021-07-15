@@ -21,9 +21,10 @@ func TestRedisRoom(t *testing.T) {
 	ctx := context.Background()
 	roomID := newRandomRoomID()
 
+	onLeave1 := roomManager1.SubscribeLeaveRoom(roomID)
 	onForward1 := roomManager1.SubscribeForwardMessage(roomID)
-	onLeave2 := roomManager1.SubscribeLeaveRoom(roomID)
-	onForward2 := roomManager1.SubscribeForwardMessage(roomID)
+	onLeave2 := roomManager2.SubscribeLeaveRoom(roomID)
+	onForward2 := roomManager2.SubscribeForwardMessage(roomID)
 
 	client1ID := newRandomClientID()
 	joinResp, err := roomManager1.JoinRoom(ctx, roomID, client1ID)
@@ -51,11 +52,17 @@ func TestRedisRoom(t *testing.T) {
 		Payload: "world",
 	}))
 
-	for _, expected := range []string{"hello", "world"} {
+	for _, expected := range []struct {
+		sender  ClientID
+		payload string
+	}{
+		{sender: client1ID, payload: "hello"},
+		{sender: client1ID, payload: "world"},
+	} {
 		fmsg := testutils.MustReceiveChan(t, onForward2, 3*time.Second).(*roomMessage)
-		assert.Equal(t, client1ID, fmsg.Sender)
+		assert.Equal(t, expected.sender, fmsg.Sender)
 		assert.Equal(t, roomMessageTypeForward, fmsg.Type)
-		assert.Equal(t, expected, fmsg.Payload)
+		assert.Equal(t, expected.payload, fmsg.Payload)
 	}
 
 	assert.NoError(t, roomManager2.ForwardMessage(ctx, roomID, &roomMessage{
@@ -63,15 +70,30 @@ func TestRedisRoom(t *testing.T) {
 		Type:    roomMessageTypeForward,
 		Payload: "foo",
 	}))
-	fmsg := testutils.MustReceiveChan(t, onForward1, 3*time.Second).(*roomMessage)
-	assert.Equal(t, client2ID, fmsg.Sender)
-	assert.Equal(t, roomMessageTypeForward, fmsg.Type)
-	assert.Equal(t, "foo", fmsg.Payload)
+
+	for _, expected := range []struct {
+		sender  ClientID
+		payload string
+	}{
+		{sender: client1ID, payload: "hello"},
+		{sender: client1ID, payload: "world"},
+		{sender: client2ID, payload: "foo"},
+	} {
+		fmsg := testutils.MustReceiveChan(t, onForward1, 3*time.Second).(*roomMessage)
+		assert.Equal(t, expected.sender, fmsg.Sender)
+		assert.Equal(t, roomMessageTypeForward, fmsg.Type)
+		assert.Equal(t, expected.payload, fmsg.Payload)
+	}
 
 	leaveResp, err := roomManager1.LeaveRoom(ctx, roomID, client1ID)
 	assert.NoError(t, err)
 	assert.True(t, leaveResp.OtherClientExists)
 	testutils.MustReceiveChan(t, onLeave2, 3*time.Second)
+
+	leaveResp, err = roomManager2.LeaveRoom(ctx, roomID, client2ID)
+	assert.NoError(t, err)
+	assert.False(t, leaveResp.OtherClientExists)
+	testutils.MustReceiveChan(t, onLeave1, 3*time.Second)
 }
 
 func newTestRedisClient() *redis.Client {

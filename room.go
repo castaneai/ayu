@@ -76,7 +76,7 @@ type redisRoom struct {
 }
 
 func newRedisRoom(client *redis.Client, roomID RoomID, logger Logger) *redisRoom {
-	forwardCh := make(chan *roomMessage)
+	forwardCh := make(chan *roomMessage, 100)
 	leaveCh := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	room := &redisRoom{
@@ -143,8 +143,7 @@ func (r *redisRoom) join(ctx context.Context, clientID ClientID) (*joinRoomRespo
 
 func (r *redisRoom) publishRoomMessage(ctx context.Context, rm *roomMessage) error {
 	r.mu.Lock()
-	full := r.full
-	r.mu.Unlock()
+	defer r.mu.Unlock()
 
 	publish := func(rm *roomMessage) error {
 		b, err := json.Marshal(rm)
@@ -156,7 +155,7 @@ func (r *redisRoom) publishRoomMessage(ctx context.Context, rm *roomMessage) err
 		}
 		return nil
 	}
-	if full {
+	if r.full {
 		for _, rm := range r.forwardSendBuf {
 			if err := publish(rm); err != nil {
 				return err
@@ -190,6 +189,7 @@ func (r *redisRoom) handleRoomMessage(rm *roomMessage, forwardCh chan<- *roomMes
 }
 
 func (r *redisRoom) leave(ctx context.Context, clientID ClientID) (*leaveRoomResponse, error) {
+	defer r.stopSub()
 	if err := r.lock.Lock(); err != nil {
 		return nil, err
 	}
