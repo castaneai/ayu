@@ -213,19 +213,15 @@ func (r *redisRoom) leave(ctx context.Context, clientID ClientID) (*leaveRoomRes
 	return &leaveRoomResponse{OtherClientExists: otherClientExists}, nil
 }
 
-type RedisRoomManager struct {
+type redisRoomManager struct {
 	client *redis.Client
 	rooms  map[RoomID]*redisRoom
 	mu     sync.Mutex
 	logger Logger
 }
 
-func NewRedisRoomManager(client *redis.Client) *RedisRoomManager {
-	logger, err := newDefaultLogger()
-	if err != nil {
-		panic(err)
-	}
-	return &RedisRoomManager{
+func newRedisRoomManager(client *redis.Client, logger Logger) *redisRoomManager {
+	return &redisRoomManager{
 		client: client,
 		rooms:  map[RoomID]*redisRoom{},
 		mu:     sync.Mutex{},
@@ -233,27 +229,27 @@ func NewRedisRoomManager(client *redis.Client) *RedisRoomManager {
 	}
 }
 
-func (m *RedisRoomManager) JoinRoom(ctx context.Context, roomID RoomID, clientID ClientID) (*joinRoomResponse, error) {
+func (m *redisRoomManager) JoinRoom(ctx context.Context, roomID RoomID, clientID ClientID) (*joinRoomResponse, error) {
 	return m.getRoom(roomID).join(ctx, clientID)
 }
 
-func (m *RedisRoomManager) LeaveRoom(ctx context.Context, roomID RoomID, clientID ClientID) (*leaveRoomResponse, error) {
+func (m *redisRoomManager) LeaveRoom(ctx context.Context, roomID RoomID, clientID ClientID) (*leaveRoomResponse, error) {
 	return m.getRoom(roomID).leave(ctx, clientID)
 }
 
-func (m *RedisRoomManager) ForwardMessage(ctx context.Context, roomID RoomID, rm *roomMessage) error {
+func (m *redisRoomManager) ForwardMessage(ctx context.Context, roomID RoomID, rm *roomMessage) error {
 	return m.getRoom(roomID).publishRoomMessage(ctx, rm)
 }
 
-func (m *RedisRoomManager) SubscribeForwardMessage(roomID RoomID) <-chan *roomMessage {
+func (m *redisRoomManager) SubscribeForwardMessage(roomID RoomID) <-chan *roomMessage {
 	return m.getRoom(roomID).recvForwardCh
 }
 
-func (m *RedisRoomManager) SubscribeLeaveRoom(roomID RoomID) <-chan struct{} {
+func (m *redisRoomManager) SubscribeLeaveRoom(roomID RoomID) <-chan struct{} {
 	return m.getRoom(roomID).leaveCh
 }
 
-func (m *RedisRoomManager) getRoom(roomID RoomID) *redisRoom {
+func (m *redisRoomManager) getRoom(roomID RoomID) *redisRoom {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	room, ok := m.rooms[roomID]

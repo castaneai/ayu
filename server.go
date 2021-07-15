@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"golang.org/x/net/websocket"
 )
 
@@ -32,13 +33,37 @@ type clientProxy struct {
 	iceServers   []*ICEServer
 }
 
+type ServerOption interface {
+	apply(opts *serverOptions)
+}
+
+type serverOptions struct {
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+	pingInterval time.Duration
+	pongTimeout  time.Duration
+	logger       Logger
+	authn        Authenticator
+}
+
+func defaultServerOptions() *serverOptions {
+	return &serverOptions{
+		readTimeout:  90 * time.Second,
+		writeTimeout: 90 * time.Second,
+		pingInterval: 5 * time.Second,
+		pongTimeout:  60 * time.Second,
+		authn:        &insecureAuthenticator{},
+		logger:       nil,
+	}
+}
+
 type Server struct {
 	logger      Logger
 	opts        *serverOptions
 	roomManager RoomManager
 }
 
-func NewServer(roomManager RoomManager, opts ...ServerOption) *Server {
+func NewServer(redisClient *redis.Client, opts ...ServerOption) *Server {
 	dopts := defaultServerOptions()
 	for _, opt := range opts {
 		opt.apply(dopts)
@@ -54,7 +79,7 @@ func NewServer(roomManager RoomManager, opts ...ServerOption) *Server {
 	return &Server{
 		logger:      logger,
 		opts:        defaultServerOptions(),
-		roomManager: roomManager,
+		roomManager: newRedisRoomManager(redisClient, logger),
 	}
 }
 
@@ -320,11 +345,51 @@ func (s *Server) forwardCandidateToRoom(sender *clientProxy, msg *message) {
 		s.logger.Errorf("failed to forward candidate message to room: %+v", err)
 		return
 	}
-	s.logger.Infof("forwarded message: %+v", string(msg.Payload))
+	s.logger.Infof("forwarding: %+v", string(msg.Payload))
 }
 
 func (s *Server) forwardCandidateFromRoom(receiver *clientProxy, payload string) {
 	if err := s.writeText(receiver.conn, payload); err != nil {
 		s.logger.Errorf("failed to forward candidate message from room: %+v", err)
 	}
+}
+
+func readJSONMessage(ctx context.Context, conn *websocket.Conn, v interface{}) error {
+	result := make(chan error)
+	go func() {
+		result <- websocket.JSON.Receive(conn, v)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-result:
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+}
+
+func writeMessage(ctx context.Context, conn *websocket.Conn, v interface{}, codec websocket.Codec) error {
+	result := make(chan error)
+	go func() {
+		result <- codec.Send(conn, v)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-result:
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+}
+
+func writeJSONMessage(ctx context.Context, conn *websocket.Conn, v interface{}) error {
+	return writeMessage(ctx, conn, v, websocket.JSON)
+}
+
+func writeTextMessage(ctx context.Context, conn *websocket.Conn, v interface{}) error {
+	return writeMessage(ctx, conn, v, websocket.Message)
 }

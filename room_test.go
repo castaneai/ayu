@@ -14,8 +14,10 @@ import (
 func TestRedisRoom(t *testing.T) {
 	rd1 := newTestRedisClient()
 	rd2 := newTestRedisClient()
-	roomManager1 := NewRedisRoomManager(rd1)
-	roomManager2 := NewRedisRoomManager(rd2)
+	logger, err := newDefaultLogger()
+	assert.NoError(t, err)
+	roomManager1 := newRedisRoomManager(rd1, logger)
+	roomManager2 := newRedisRoomManager(rd2, logger)
 	ctx := context.Background()
 	roomID := newRandomRoomID()
 

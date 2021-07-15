@@ -11,12 +11,11 @@ import (
 )
 
 func main() {
-	rd := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
-	rm := ayu.NewRedisRoomManager(rd)
-	sv := ayu.NewServer(rm)
+	redisClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	sv := ayu.NewServer(redisClient)
 	http.Handle("/signaling", sv)
 
-	addr := ":8088"
+	addr := ":8080"
 	if p := os.Getenv("PORT"); p != "" {
 		addr = fmt.Sprintf(":%s", p)
 	}

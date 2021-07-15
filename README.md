@@ -2,10 +2,41 @@
 
 ayu is WebRTC Signaling Server with [ayame](https://github.com/OpenAyame/ayame)-like protocol.
 
-- **Scalable**: ayu uses Redis to store the Room state, so it can be used on serverless WebSocket service(e.g. Cloud Run).
-- **No vendor lock-in**: ayu depends only on Go and Redis. It is not locked in to any particular cloud provider.
-- **Composable**: ayu provides a net/http.Handler compatible WebSocket server in a Go package.
+- **Scalable**: ayu uses Redis to store room states, so it can be used on serverless WebSocket service(e.g. Cloud Run).
+- **No vendor lock-in**: ayu depends only on Go and Redis. It is not locked in to any specific cloud provider.
+- **Composable**: ayu provides a net/http.Handler compatible WebSocket handler in a Go package.
 - **Customizable**: ayu provides authentication and logger interface, which can be customized.
+
+## Usage
+
+In the following example, `ws://localhost:8080/signaling` will be the endpoint of the signaling server.
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+
+	"github.com/castaneai/ayu"
+	"github.com/go-redis/redis/v8"
+)
+
+func main() {
+	redisClient := redis.NewClient(&redis.Options{Addr: "x.x.x.x:6379"})
+	sv := ayu.NewServer(redisClient)
+	http.Handle("/signaling", sv)
+
+	addr := ":8080"
+	if p := os.Getenv("PORT"); p != "" {
+		addr = fmt.Sprintf(":%s", p)
+	}
+	log.Printf("listening on %s...", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
+}
+```
 
 ## Testing
 

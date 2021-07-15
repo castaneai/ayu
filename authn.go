@@ -22,9 +22,9 @@ type AuthnResponse struct {
 	AuthzMetadata map[string]interface{}
 }
 
-type NopAuthenticator struct{}
+type insecureAuthenticator struct{}
 
-func (a *NopAuthenticator) Authenticate(ctx context.Context, req *AuthnRequest) (*AuthnResponse, error) {
+func (a *insecureAuthenticator) Authenticate(ctx context.Context, req *AuthnRequest) (*AuthnResponse, error) {
 	return &AuthnResponse{
 		Allowed: true,
 		ICEServers: []*ICEServer{
