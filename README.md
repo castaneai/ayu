@@ -2,14 +2,15 @@
 
 ayu is WebRTC Signaling Server with [ayame](https://github.com/OpenAyame/ayame)-like protocol.
 
-- **Scalable**: ayu uses Redis to store room states, so it can be used on serverless WebSocket service(e.g. Cloud Run).
-- **No vendor lock-in**: ayu depends only on Redis. It is not locked in to any specific cloud provider.
+- **Scalable**: ayu uses Redis to store room states, so it can be used on serverless platforms (e.g. Cloud Run).
 - **Composable**: ayu provides a net/http compatible WebSocket handler.
 - **Customizable**: ayu provides authentication and logger interface, which can be customized.
+- **No vendor lock-in**: ayu depends only on Redis. It is not locked in to any specific cloud provider.
 
 ## Usage
 
 In the following example, `ws://localhost:8080/signaling` will be the endpoint of the signaling server.
+Please see [ayame-spec](https://github.com/OpenAyame/ayame-spec) for mode details on the protocol.
 
 ```go
 package main
