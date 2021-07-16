@@ -287,6 +287,7 @@ func (m *redisMutex) Lock() error {
 		if acquired {
 			return nil
 		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
