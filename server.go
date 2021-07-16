@@ -96,7 +96,7 @@ func NewServer(redisClient *redis.Client, opts ...ServerOption) *Server {
 	}
 	return &Server{
 		logger:      logger,
-		opts:        defaultServerOptions(),
+		opts:        dopts,
 		roomManager: newRedisRoomManager(redisClient, logger),
 	}
 }
