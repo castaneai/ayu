@@ -110,7 +110,7 @@ func newRedisRoom(client *redis.Client, roomID RoomID, logger Logger, expiration
 			case *redis.Pong:
 				// ignore
 			default:
-				logger.Warnf("unknown message received from pub/sub", "message", m)
+				logger.Warnw("unknown message received from pub/sub", "message", m)
 			}
 		}
 	}()
@@ -224,9 +224,7 @@ func (r *redisRoom) handleRoomMessage(rm *roomMessage) {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	var targets []ClientID
 	for target, sub := range r.subscribers {
-		targets = append(targets, target)
 		select {
 		case sub <- rm:
 		default:
@@ -234,7 +232,6 @@ func (r *redisRoom) handleRoomMessage(rm *roomMessage) {
 				"message", rm, "target", target)
 		}
 	}
-	r.logger.Debugw("received forward", "targets", targets, "message", rm)
 }
 
 func (r *redisRoom) leave(ctx context.Context, clientID ClientID, otherClientExists bool) error {

@@ -401,21 +401,24 @@ func (s *Server) startReceive(client *clientProxy) (<-chan *PingPongMessage, <-c
 					close(disconnectedCh)
 					return
 				} else {
-					s.logger.Errorw("failed to read message", "error", err)
+					s.logger.Errorw("failed to read message",
+						"error", err, "room", client.roomID, "client", client.clientID)
 				}
 			}
 			switch msg.Type {
 			case MessageTypePong:
 				var pong PingPongMessage
 				if err := json.Unmarshal(msg.Payload, &pong); err != nil {
-					s.logger.Errorw("failed to unmarshal pong message", "error", err)
+					s.logger.Errorw("failed to unmarshal pong message",
+						"error", err, "room", client.roomID, "client", client.clientID)
 					continue
 				}
 				pongCh <- &pong
 			case MessageTypeOffer, MessageTypeAnswer, MessageTypeCandidate:
 				forwardCh <- &msg
 			default:
-				s.logger.Warnf("unknown message type received: %s", msg.Type)
+				s.logger.Warnw("unknown message type received",
+					"message", msg, "room", client.roomID, "client", client.clientID)
 			}
 		}
 	}()
@@ -430,13 +433,15 @@ func (s *Server) forwardToRoom(sender *clientProxy, msg *message) {
 		Type:    roomMessageTypeForward,
 		Payload: string(msg.Payload),
 	}); err != nil {
-		s.logger.Errorf("failed to forward message to room: %+v", err)
+		s.logger.Errorw("failed to forward message to room",
+			"error", err, "room", sender.roomID, "client", sender.clientID)
 	}
 }
 
 func (s *Server) forwardFromRoom(receiver *clientProxy, payload string) {
 	if err := s.writeText(receiver.conn, payload); err != nil {
-		s.logger.Errorf("failed to forward candidate message from room: %+v", err)
+		s.logger.Errorw("failed to forward message from room",
+			"error", err, "room", receiver.roomID, "client", receiver.clientID)
 	}
 }
 
