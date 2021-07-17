@@ -177,7 +177,8 @@ func (s *Server) handle(conn *websocket.Conn) {
 			case roomMessageTypeForward:
 				s.forwardFromRoom(client, msg.Payload)
 			case roomMessageTypeLeave:
-				s.logger.Infof("one client left and closing the other client (room: %s)", client.roomID)
+				s.logger.Infof("one client left and ayu kicks the other client (room: %s, one: %s, other: %s)",
+					client.roomID, msg.Sender, client.clientID)
 				return
 			}
 		}
