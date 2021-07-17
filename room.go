@@ -26,6 +26,7 @@ const (
 )
 
 var (
+	// ErrRoomIsFull is returned when the room trying to join is full.
 	ErrRoomIsFull = errors.New("room is full")
 )
 
@@ -329,7 +330,7 @@ func (m *redisRoomManager) managingRooms() []RoomID {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var roomIDs []RoomID
-	for rid, _ := range m.rooms {
+	for rid := range m.rooms {
 		roomIDs = append(roomIDs, rid)
 	}
 	return roomIDs

@@ -11,7 +11,7 @@ type Authenticator interface {
 type AuthnRequest struct {
 	RoomID        RoomID
 	ClientID      ClientID
-	ConnectionID  ConnectionID
+	ConnectionID  connectionID
 	AuthnMetadata map[string]interface{}
 }
 

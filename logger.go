@@ -5,6 +5,7 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+// Logger is a logger interface
 type Logger interface {
 	Debugf(template string, args ...interface{})
 	Infof(template string, args ...interface{})
@@ -12,7 +13,7 @@ type Logger interface {
 	Errorf(template string, args ...interface{})
 }
 
-func NewDefaultLogger() (*zap.SugaredLogger, error) {
+func newDefaultLogger() (*zap.SugaredLogger, error) {
 	config := zap.NewDevelopmentConfig()
 	config.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	zapLogger, err := config.Build(zap.AddStacktrace(zap.FatalLevel))

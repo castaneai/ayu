@@ -22,47 +22,53 @@ const (
 )
 
 var (
+	// ErrUnauthenticated is returned when the authentication fails.
 	ErrUnauthenticated = errors.New("unauthenticated")
 )
 
 type clientProxy struct {
 	roomID       RoomID
 	clientID     ClientID
-	connectionID ConnectionID
+	connectionID connectionID
 	conn         *websocket.Conn
 	iceServers   []*ICEServer
 }
 
+// ServerOption represents an option for Server.
 type ServerOption interface {
 	apply(opts *serverOptions)
 }
 
-type ServerOptionFunc func(opts *serverOptions)
+type serverOptionFunc func(opts *serverOptions)
 
-func (f ServerOptionFunc) apply(opts *serverOptions) {
+func (f serverOptionFunc) apply(opts *serverOptions) {
 	f(opts)
 }
 
+// WithAuthenticator specifies the custom authentication for joining the room.
 func WithAuthenticator(authn Authenticator) ServerOption {
-	return ServerOptionFunc(func(opts *serverOptions) {
+	return serverOptionFunc(func(opts *serverOptions) {
 		opts.authn = authn
 	})
 }
 
+// WithLogger specifies the custom logger.
 func WithLogger(logger Logger) ServerOption {
-	return ServerOptionFunc(func(opts *serverOptions) {
+	return serverOptionFunc(func(opts *serverOptions) {
 		opts.logger = logger
 	})
 }
 
+// WithRoomExpiration specifies the custom room expiration in Redis.
 func WithRoomExpiration(expiration time.Duration) ServerOption {
-	return ServerOptionFunc(func(opts *serverOptions) {
+	return serverOptionFunc(func(opts *serverOptions) {
 		opts.roomExpiration = expiration
 	})
 }
 
+// WithPingInterval specifies the custom ping interval.
 func WithPingInterval(interval time.Duration) ServerOption {
-	return ServerOptionFunc(func(opts *serverOptions) {
+	return serverOptionFunc(func(opts *serverOptions) {
 		opts.pingInterval = interval
 	})
 }
@@ -89,6 +95,7 @@ func defaultServerOptions() *serverOptions {
 	}
 }
 
+// Server is a server of ayu.
 type Server struct {
 	logger      Logger
 	opts        *serverOptions
@@ -97,6 +104,7 @@ type Server struct {
 	mu          sync.RWMutex
 }
 
+// NewServer creates a new ayu server.
 func NewServer(redisClient *redis.Client, opts ...ServerOption) *Server {
 	dopts := defaultServerOptions()
 	for _, opt := range opts {
@@ -104,7 +112,7 @@ func NewServer(redisClient *redis.Client, opts ...ServerOption) *Server {
 	}
 	logger := dopts.logger
 	if logger == nil {
-		lg, err := NewDefaultLogger()
+		lg, err := newDefaultLogger()
 		if err != nil {
 			panic(err)
 		}
@@ -119,10 +127,13 @@ func NewServer(redisClient *redis.Client, opts ...ServerOption) *Server {
 	}
 }
 
+// ServeHTTP implements the http.Handler interface for a WebSocket.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	websocket.Handler(s.handle).ServeHTTP(w, r)
 }
 
+// Shutdown shuts down the server.
+// When Shutdown is called, all connections (WebSocket and Redis) will be forcibly disconnected.
 func (s *Server) Shutdown() {
 	s.logger.Infof("shutting down server...")
 	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
@@ -261,7 +272,7 @@ func (s *Server) authn(conn *websocket.Conn) (*clientProxy, error) {
 		return nil, fmt.Errorf("failed to read register message: %w", err)
 	}
 	authn := s.opts.authn
-	connID := NewRandomConnectionID()
+	connID := newRandomConnectionID()
 	req := &AuthnRequest{
 		RoomID:        regMsg.RoomID,
 		ClientID:      regMsg.ClientID,

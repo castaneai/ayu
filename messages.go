@@ -6,6 +6,8 @@ import (
 	"github.com/google/uuid"
 )
 
+// MessageType represents a type of messages in ayame protocol.
+// See https://github.com/OpenAyame/ayame-spec for details
 type MessageType string
 
 const (
@@ -20,14 +22,20 @@ const (
 	MessageTypeReject    MessageType = "reject"
 )
 
+// RoomID represents a room ID
 type RoomID string
-type ClientID string
-type ConnectionID string
 
-func NewRandomConnectionID() ConnectionID {
-	return ConnectionID(uuid.Must(uuid.NewRandom()).String())
+// ClientID represents a client ID
+type ClientID string
+
+// connectionID represents a connection ID (internal-use only)
+type connectionID string
+
+func newRandomConnectionID() connectionID {
+	return connectionID(uuid.Must(uuid.NewRandom()).String())
 }
 
+// ICEServer represents ICE server's information
 type ICEServer struct {
 	URLs       []string `json:"urls"`
 	UserName   string   `json:"username,omitempty"`
@@ -51,10 +59,14 @@ func (j *message) UnmarshalJSON(bytes []byte) error {
 	return nil
 }
 
+// PingPongMessage represents a ping-pong message
+// See https://github.com/OpenAyame/ayame-spec for details
 type PingPongMessage struct {
 	Type MessageType `json:"type"`
 }
 
+// RegisterMessage represents a register message
+// See https://github.com/OpenAyame/ayame-spec for details
 type RegisterMessage struct {
 	Type          MessageType            `json:"type"`
 	RoomID        RoomID                 `json:"roomId"`
@@ -62,6 +74,8 @@ type RegisterMessage struct {
 	AuthnMetadata map[string]interface{} `json:"authnMetadata,omitempty"`
 }
 
+// AcceptMessage represents a register message
+// See https://github.com/OpenAyame/ayame-spec for details
 type AcceptMessage struct {
 	Type          MessageType  `json:"type"`
 	IceServers    []*ICEServer `json:"iceServers"`
@@ -69,22 +83,27 @@ type AcceptMessage struct {
 	IsExistUser   bool         `json:"isExistUser"` // for compatibility
 }
 
+// RejectMessage represents a reject message
+// See https://github.com/OpenAyame/ayame-spec for details
 type RejectMessage struct {
 	Type   MessageType `json:"type"`
 	Reason string      `json:"reason"`
 }
 
+// ByeMessage represents a bye message
+// See https://github.com/OpenAyame/ayame-spec for details
 type ByeMessage struct {
 	Type MessageType `json:"type"`
 }
 
+// CandidateMessage represents a candidate message
+// See https://github.com/OpenAyame/ayame-spec for details
 type CandidateMessage struct {
 	Type         MessageType       `json:"type"`
 	ICECandidate *ICECandidateInit `json:"ice,omitempty"`
 }
 
 // ICECandidateInit is used to serialize ice candidates
-// copied from pion/webrtc
 type ICECandidateInit struct {
 	Candidate        string  `json:"candidate"`
 	SDPMid           *string `json:"sdpMid"`
