@@ -304,10 +304,9 @@ func (m *redisRoomManager) LeaveRoom(ctx context.Context, roomID RoomID, clientI
 	if err := room.leave(ctx, clientID, otherClientExists); err != nil {
 		return err
 	}
-	if !otherClientExists {
-		if err := m.DeleteRoom(ctx, roomID); err != nil {
-			return fmt.Errorf("failed to delete room: %w", err)
-		}
+	// If one client leaves the room, the room will be deleted.
+	if err := m.DeleteRoom(ctx, roomID); err != nil {
+		return fmt.Errorf("failed to delete room: %w", err)
 	}
 	return nil
 }
