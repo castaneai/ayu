@@ -165,16 +165,17 @@ func (s *Server) handle(conn *websocket.Conn) {
 		s.logger.Errorf("failed to join room(room: %s, client: %s): %+v", client.roomID, client.clientID, err)
 		return
 	}
-	defer s.leaveRoom(client)
 	pongCh, forwardCh, disconnectedCh := s.startReceive(client)
 	pongTimeoutCh := s.startPingPong(client, pongCh)
 
 	for {
 		select {
 		case <-disconnectedCh:
+			s.leaveRoom(client)
 			s.logger.Infof("client disconnected (room: %s, client: %s)", client.roomID, client.clientID)
 			return
 		case <-pongTimeoutCh:
+			s.leaveRoom(client)
 			s.logger.Warnf("pong timeout (%v)", s.opts.pongTimeout)
 			return
 		case msg := <-forwardCh:
@@ -255,12 +256,19 @@ func (s *Server) leaveRoom(client *clientProxy) {
 	}
 	defer lock.Unlock()
 
-	otherClientExists := len(lock.clientIDs) > 1
-	if err := s.roomManager.LeaveRoom(ctx, client.roomID, client.clientID, otherClientExists); err != nil {
-		s.logger.Errorf("failed to leave room (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
+	exists, err := s.roomManager.roomExists(ctx, client.roomID)
+	if err != nil {
+		s.logger.Errorf("failed to check room exists (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
+		return
 	}
-	if err := s.roomManager.UnsubscribeMessage(client.roomID, client.clientID); err != nil {
-		s.logger.Errorf("failed to unsubscribe (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
+	if exists {
+		if err := s.roomManager.UnsubscribeMessage(client.roomID, client.clientID); err != nil {
+			s.logger.Errorf("failed to unsubscribe (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
+		}
+		otherClientExists := len(lock.clientIDs) > 1
+		if err := s.roomManager.LeaveRoom(ctx, client.roomID, client.clientID, otherClientExists); err != nil {
+			s.logger.Errorf("failed to leave room (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
+		}
 	}
 	s.logger.Infof("client left (room: %s, client: %s)", client.roomID, client.clientID)
 }

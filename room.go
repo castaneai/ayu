@@ -374,6 +374,14 @@ func (m *redisRoomManager) BeginRoomLock(ctx context.Context, roomID RoomID) (*r
 	return room.beginLock(ctx)
 }
 
+func (m *redisRoomManager) roomExists(ctx context.Context, roomID RoomID) (bool, error) {
+	reply, err := m.client.Exists(ctx, redisRoomMembersKey(roomID)).Result()
+	if err != nil {
+		return false, err
+	}
+	return reply == 1, nil
+}
+
 func (m *redisRoomManager) getRoom(roomID RoomID) (*redisRoom, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
