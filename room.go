@@ -80,11 +80,11 @@ func newRedisRoom(client *redis.Client, roomID RoomID, logger Logger, expiration
 			rctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
 			defer cancel()
 			if err := sub.Unsubscribe(rctx, redisRoomPubSubKey(roomID)); err != nil {
-				logger.Errorw("failed to unsubscribe redis pub/sub", "error", err, "room", roomID)
+				logger.Errorf("failed to unsubscribe redis pub/sub (room: %s): %+v", roomID, err)
 			}
-			logger.Debugw("closing redis pub/sub subscription", "room", roomID)
+			logger.Debugf("closing redis pub/sub subscription (room: %s)", roomID)
 			if err := sub.Close(); err != nil {
-				logger.Errorw("failed to close redis pub/sub", "error", err, "room", roomID)
+				logger.Errorf("failed to close redis pub/sub (room: %s): %+v", roomID, err)
 			}
 		}()
 		var once sync.Once
@@ -92,7 +92,7 @@ func newRedisRoom(client *redis.Client, roomID RoomID, logger Logger, expiration
 			recv, err := sub.Receive(ctx)
 			if err != nil {
 				if ctx.Err() == nil {
-					room.logger.Errorw("failed to subscribe from redis", "error", err, "room", room.roomID)
+					room.logger.Errorf("failed to subscribe from redis (room: %s): %+v", roomID, err)
 				}
 				return
 			}
@@ -102,15 +102,14 @@ func newRedisRoom(client *redis.Client, roomID RoomID, logger Logger, expiration
 			case *redis.Message:
 				var rm roomMessage
 				if err := json.Unmarshal([]byte(m.Payload), &rm); err != nil {
-					logger.Errorw("failed to unmarshal subscribed room message",
-						"error", err, "room", room.roomID)
+					logger.Errorf("failed to unmarshal subscribed room message (room: %s): %+v", roomID, err)
 					continue
 				}
 				go room.handleRoomMessage(&rm)
 			case *redis.Pong:
 				// ignore
 			default:
-				logger.Warnw("unknown message received from pub/sub", "message", m)
+				logger.Warnf("unknown message received from pub/sub (room: %s): %+v", roomID, m)
 			}
 		}
 	}()
@@ -167,7 +166,7 @@ func (r *redisRoom) beginLock(ctx context.Context) (*roomLock, error) {
 		clientIDs: clientIDs,
 		unlock: func() {
 			if err := r.lock.Unlock(); err != nil {
-				r.logger.Errorw("failed to unlock room", "error", err, "room", r.roomID)
+				r.logger.Errorf("failed to unlock room (room: %s): %+v", r.roomID, err)
 			}
 		},
 	}, nil
@@ -178,7 +177,7 @@ func (r *redisRoom) publishMessages(ctx context.Context, rms []*roomMessage, oth
 		for _, rm := range rms {
 			if rm.Type == roomMessageTypeForward {
 				r.publishBuf.Add(rm)
-				r.logger.Debugw("buffered", "message", rm)
+				r.logger.Debugf("buffered message (room: %s): %+v", r.roomID, rm)
 			}
 		}
 		return nil
@@ -193,7 +192,7 @@ func (r *redisRoom) publishMessages(ctx context.Context, rms []*roomMessage, oth
 		if _, err := r.client.Publish(ctx, redisRoomPubSubKey(r.roomID), string(b)).Result(); err != nil {
 			return fmt.Errorf("failed to publish room message: %w", err)
 		}
-		r.logger.Debugw("published", "message", rm)
+		r.logger.Debugf("published message (room: %s): %+v", r.roomID, rm)
 	}
 	return nil
 }
@@ -201,25 +200,23 @@ func (r *redisRoom) publishMessages(ctx context.Context, rms []*roomMessage, oth
 func (r *redisRoom) handleRoomMessage(rm *roomMessage) {
 	switch rm.Type {
 	case roomMessageTypeJoin:
-		r.logger.Debugw("two clients joined in the room",
-			"room", r.roomID)
+		r.logger.Debugf("two clients joined in the room (room: %s)", r.roomID)
 		ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
 		defer cancel()
 		lock, err := r.beginLock(ctx)
 		if err != nil {
-			r.logger.Errorw("failed to begin room lock", "error", err, "room", r.roomID)
+			r.logger.Errorf("failed to begin room lock (room: %s): %+v", r.roomID, err)
 			return
 		}
 		defer lock.Unlock()
 		otherClientExists := len(lock.clientIDs) > 1
 		if err := r.publishMessages(ctx, nil, otherClientExists); err != nil {
-			r.logger.Errorw("failed to publish buffered messages", "error", err)
+			r.logger.Errorf("failed to publish buffered messages (room: %s): %+v", r.roomID, err)
 		}
 	case roomMessageTypeLeave:
 	case roomMessageTypeForward:
 	default:
-		r.logger.Warnw("unknown forward message type received",
-			"message", rm, "room", r.roomID)
+		r.logger.Warnf("unknown room message received (room: %s): %+v", r.roomID, rm)
 		return
 	}
 	r.mu.RLock()
@@ -228,8 +225,8 @@ func (r *redisRoom) handleRoomMessage(rm *roomMessage) {
 		select {
 		case sub <- rm:
 		default:
-			r.logger.Warnw("failed to forward message from room (channel is full)",
-				"message", rm, "target", target)
+			r.logger.Warnf("failed to forward message from room because channel is full (room: %s, target: %s): %+v",
+				r.roomID, target, rm)
 		}
 	}
 }
@@ -253,7 +250,7 @@ func (r *redisRoom) subscribeRoomMessage(clientID ClientID) <-chan *roomMessage 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.subscribers[clientID] = subCh
-	r.logger.Debugw("subscribe", "room", r.roomID, "client", clientID)
+	r.logger.Debugf("subscribe room pub/sub (room: %s, client: %s)", r.roomID, clientID)
 	return subCh
 }
 
@@ -261,7 +258,7 @@ func (r *redisRoom) unsubscribeRoomMessage(clientID ClientID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.subscribers, clientID)
-	r.logger.Debugw("unsubscribe", "room", r.roomID, "client", clientID)
+	r.logger.Debugf("unsubscribe room pub/sub (room: %s, client: %s)", r.roomID, clientID)
 }
 
 func (r *redisRoom) delete(ctx context.Context) error {
@@ -269,7 +266,7 @@ func (r *redisRoom) delete(ctx context.Context) error {
 	if _, err := r.client.Del(ctx, redisRoomMembersKey(r.roomID)).Result(); err != nil {
 		return err
 	}
-	r.logger.Infow("room deleted", "room", r.roomID)
+	r.logger.Infof("room deleted (room: %s)", r.roomID)
 	return nil
 }
 

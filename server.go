@@ -129,7 +129,7 @@ func (s *Server) Shutdown() {
 	defer cancel()
 	for _, rid := range s.roomManager.managingRooms() {
 		if err := s.roomManager.DeleteRoom(ctx, rid); err != nil {
-			s.logger.Errorw("failed to delete room", "error", err, "room", rid)
+			s.logger.Errorf("failed to delete room(%s): %+v", rid, err)
 		}
 	}
 	s.mu.RLock()
@@ -147,13 +147,12 @@ func (s *Server) handle(conn *websocket.Conn) {
 
 	client, err := s.authn(conn)
 	if err != nil {
-		s.logger.Errorw("failed to authenticate client", "error", err)
+		s.logger.Errorf("failed to authenticate client: %+v", err)
 		return
 	}
 	onRoomMessage, err := s.joinRoom(client)
 	if err != nil {
-		s.logger.Errorw("failed to join room",
-			"error", err, "room", client.roomID, "client", client.clientID)
+		s.logger.Errorf("failed to join room(room: %s, client: %s): %+v", client.roomID, client.clientID, err)
 		return
 	}
 	defer s.leaveRoom(client)
@@ -163,12 +162,10 @@ func (s *Server) handle(conn *websocket.Conn) {
 	for {
 		select {
 		case <-disconnectedCh:
-			s.logger.Infow("client disconnected",
-				"room", client.roomID, "client", client.clientID)
+			s.logger.Infof("client disconnected (room: %s, client: %s)", client.roomID, client.clientID)
 			return
 		case <-pongTimeoutCh:
-			s.logger.Warnw("pong timeout",
-				"timeout", s.opts.pongTimeout)
+			s.logger.Warnf("pong timeout (%v)", s.opts.pongTimeout)
 			return
 		case msg := <-forwardCh:
 			s.forwardToRoom(client, msg)
@@ -180,8 +177,7 @@ func (s *Server) handle(conn *websocket.Conn) {
 			case roomMessageTypeForward:
 				s.forwardFromRoom(client, msg.Payload)
 			case roomMessageTypeLeave:
-				s.logger.Infow("the other client left",
-					"room", client.roomID, "client", client.clientID, "other", msg.Sender)
+				s.logger.Infof("one client left and closing the other client (room: %s)", client.roomID)
 				return
 			}
 		}
@@ -221,9 +217,9 @@ func (s *Server) joinRoom(client *clientProxy) (<-chan *roomMessage, error) {
 	}
 	lock.Unlock()
 	if otherClientExists {
-		s.logger.Infow("client-two joined", "room", client.roomID, "client", client.clientID)
+		s.logger.Infof("client-two joined (room: %s, client: %s)", client.roomID, client.clientID)
 	} else {
-		s.logger.Infow("client-one joined", "room", client.roomID, "client", client.clientID)
+		s.logger.Infof("client-one joined (room: %s, client: %s)", client.roomID, client.clientID)
 	}
 
 	if err := s.writeJSON(client.conn, &AcceptMessage{
@@ -243,22 +239,19 @@ func (s *Server) leaveRoom(client *clientProxy) {
 
 	lock, err := s.roomManager.BeginRoomLock(ctx, client.roomID)
 	if err != nil {
-		s.logger.Errorw("failed to begin room lock",
-			"error", err, "room", client.roomID, "client", client.clientID)
+		s.logger.Errorf("failed to begin room lock (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
 		return
 	}
 	defer lock.Unlock()
 
 	otherClientExists := len(lock.clientIDs) > 1
 	if err := s.roomManager.LeaveRoom(ctx, client.roomID, client.clientID, otherClientExists); err != nil {
-		s.logger.Errorw("failed to leave room",
-			"error", err, "room", client.roomID, "client", client.clientID)
+		s.logger.Errorf("failed to leave room (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
 	}
 	if err := s.roomManager.UnsubscribeMessage(client.roomID, client.clientID); err != nil {
-		s.logger.Errorw("failed to unsubscribe",
-			"error", err, "room", client.roomID, "client", client.clientID)
+		s.logger.Errorf("failed to unsubscribe (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
 	}
-	s.logger.Infow("client left", "room", client.roomID, "client", client.clientID)
+	s.logger.Infof("client left (room: %s, client: %s)", client.roomID, client.clientID)
 }
 
 func (s *Server) authn(conn *websocket.Conn) (*clientProxy, error) {
@@ -293,8 +286,7 @@ func (s *Server) authn(conn *websocket.Conn) (*clientProxy, error) {
 		}
 		return nil, ErrUnauthenticated
 	}
-	s.logger.Debugw("client authenticated",
-		"room", req.RoomID, "client", req.ClientID)
+	s.logger.Debugf("client authenticated (room: %s, client: %s)", req.RoomID, req.ClientID)
 	return &clientProxy{
 		roomID:       req.RoomID,
 		clientID:     req.ClientID,
@@ -330,13 +322,13 @@ func (s *Server) writeText(conn *websocket.Conn, v interface{}) error {
 func (s *Server) shutdownConn(conn *websocket.Conn) {
 	if err := s.writeJSON(conn, &ByeMessage{Type: MessageTypeBye}); err != nil {
 		if !isClosedError(err) {
-			s.logger.Errorw("failed to send bye message", "error", err)
+			s.logger.Errorf("failed to send bye message: %+v", err)
 		}
 	}
 	// close code 1000: Normal Closure (RFC 6455)
 	if err := conn.WriteClose(1000); err != nil {
 		if !isClosedError(err) {
-			s.logger.Errorw("failed to close websocket conn", "error", err)
+			s.logger.Errorf("failed to close websocket conn", err)
 		}
 	}
 	s.mu.Lock()
@@ -365,7 +357,7 @@ func (s *Server) startPingPong(client *clientProxy, pongCh <-chan *PingPongMessa
 					if isClosedError(err) {
 						return
 					} else {
-						s.logger.Errorw("failed to send ping message", "error", err)
+						s.logger.Errorf("failed to send ping message (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
 					}
 				}
 			case <-pongCh:
@@ -397,28 +389,27 @@ func (s *Server) startReceive(client *clientProxy) (<-chan *PingPongMessage, <-c
 		for {
 			var msg message
 			if err := s.readJSON(client.conn, &msg); err != nil {
-				if isClosedError(err) {
-					close(disconnectedCh)
-					return
-				} else {
-					s.logger.Errorw("failed to read message",
-						"error", err, "room", client.roomID, "client", client.clientID)
+				if !isClosedError(err) {
+					s.logger.Errorf("failed to read WebSocket message (room: %s, client: %s): %+v",
+						client.roomID, client.clientID, err)
 				}
+				close(disconnectedCh)
+				return
 			}
 			switch msg.Type {
 			case MessageTypePong:
 				var pong PingPongMessage
 				if err := json.Unmarshal(msg.Payload, &pong); err != nil {
-					s.logger.Errorw("failed to unmarshal pong message",
-						"error", err, "room", client.roomID, "client", client.clientID)
+					s.logger.Errorf("failed to unmarshal pong message (room: %s, client: %s): %+v",
+						client.roomID, client.clientID, err)
 					continue
 				}
 				pongCh <- &pong
 			case MessageTypeOffer, MessageTypeAnswer, MessageTypeCandidate:
 				forwardCh <- &msg
 			default:
-				s.logger.Warnw("unknown message type received",
-					"message", msg, "room", client.roomID, "client", client.clientID)
+				s.logger.Warnf("unknown message type received (room: %s, client: %s): %+v",
+					client.roomID, client.clientID, msg)
 			}
 		}
 	}()
@@ -433,15 +424,15 @@ func (s *Server) forwardToRoom(sender *clientProxy, msg *message) {
 		Type:    roomMessageTypeForward,
 		Payload: string(msg.Payload),
 	}); err != nil {
-		s.logger.Errorw("failed to forward message to room",
-			"error", err, "room", sender.roomID, "client", sender.clientID)
+		s.logger.Errorf("failed to forward message to room (room: %s, client: %s): %+v",
+			sender.roomID, sender.clientID, err)
 	}
 }
 
 func (s *Server) forwardFromRoom(receiver *clientProxy, payload string) {
 	if err := s.writeText(receiver.conn, payload); err != nil {
-		s.logger.Errorw("failed to forward message from room",
-			"error", err, "room", receiver.roomID, "client", receiver.clientID)
+		s.logger.Errorf("failed to forward message from room (room: %s, client: %s): %+v",
+			receiver.roomID, receiver.clientID, err)
 	}
 }
 
