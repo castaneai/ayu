@@ -367,9 +367,8 @@ func (s *Server) startPingPong(client *clientProxy, pongCh <-chan *PingPongMessa
 				if err := s.writeJSON(client.conn, &PingPongMessage{MessageTypePing}); err != nil {
 					if isClosedError(err) {
 						return
-					} else {
-						s.logger.Errorf("failed to send ping message (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
 					}
+					s.logger.Errorf("failed to send ping message (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
 				}
 			case <-pongCh:
 				resetTimer(pongTimeoutTimer, s.opts.pongTimeout)
