@@ -200,7 +200,6 @@ func (r *redisRoom) publishMessages(ctx context.Context, rms []*roomMessage, oth
 func (r *redisRoom) handleRoomMessage(rm *roomMessage) {
 	switch rm.Type {
 	case roomMessageTypeJoin:
-		r.logger.Debugf("two clients joined in the room (room: %s)", r.roomID)
 		ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
 		defer cancel()
 		lock, err := r.beginLock(ctx)
