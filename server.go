@@ -213,7 +213,7 @@ func (s *Server) joinRoom(client *clientProxy) (<-chan *roomMessage, error) {
 		}); err != nil {
 			return nil, fmt.Errorf("failed to send reject message: %w", err)
 		}
-		return nil, ErrRoomIsFull
+		return nil, errRoomIsFull
 	}
 
 	onRoomMessage, err := s.roomManager.SubscribeMessage(client.roomID, client.clientID)

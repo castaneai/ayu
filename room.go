@@ -26,8 +26,7 @@ const (
 )
 
 var (
-	// ErrRoomIsFull is returned when the room trying to join is full.
-	ErrRoomIsFull = errors.New("room is full")
+	errRoomIsFull = errors.New("room is full")
 )
 
 type roomMessage struct {
