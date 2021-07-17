@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 
 	"github.com/google/uuid"
-	"github.com/pion/webrtc/v3"
 )
 
 type MessageType string
@@ -80,6 +79,15 @@ type ByeMessage struct {
 }
 
 type CandidateMessage struct {
-	Type         MessageType              `json:"type"`
-	ICECandidate *webrtc.ICECandidateInit `json:"ice,omitempty"`
+	Type         MessageType       `json:"type"`
+	ICECandidate *ICECandidateInit `json:"ice,omitempty"`
+}
+
+// ICECandidateInit is used to serialize ice candidates
+// copied from pion/webrtc
+type ICECandidateInit struct {
+	Candidate        string  `json:"candidate"`
+	SDPMid           *string `json:"sdpMid"`
+	SDPMLineIndex    *uint16 `json:"sdpMLineIndex"`
+	UsernameFragment *string `json:"usernameFragment"`
 }

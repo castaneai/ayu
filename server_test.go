@@ -11,7 +11,6 @@ import (
 	"github.com/castaneai/ayu/internal/testutils"
 	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
-	"github.com/pion/webrtc/v3"
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/net/websocket"
 )
@@ -106,7 +105,7 @@ func TestServer(t *testing.T) {
 				// Possibly send candidate, before the other client joins.
 				assert.NoError(t, websocket.JSON.Send(conn1, &CandidateMessage{
 					Type:         MessageTypeCandidate,
-					ICECandidate: &webrtc.ICECandidateInit{Candidate: "test-candidate"},
+					ICECandidate: &ICECandidateInit{Candidate: "test-candidate"},
 				}))
 
 				conn2, recv2 := tc.dialer.DialClient2(t)
@@ -117,14 +116,14 @@ func TestServer(t *testing.T) {
 				}))
 				assert.Equal(t, MessageTypeAccept, testutils.MustReceiveChan(t, recv2, 3*time.Second).(*message).Type)
 
-				assert.NoError(t, websocket.JSON.Send(conn2, &webrtc.SessionDescription{
-					Type: webrtc.SDPTypeOffer,
+				assert.NoError(t, websocket.JSON.Send(conn2, &sdp{
+					Type: "offer",
 					SDP:  "test",
 				}))
 				assert.Equal(t, MessageTypeCandidate, testutils.MustReceiveChan(t, recv2, 3*time.Second).(*message).Type)
 				assert.Equal(t, MessageTypeOffer, testutils.MustReceiveChan(t, recv1, 3*time.Second).(*message).Type)
-				assert.NoError(t, websocket.JSON.Send(conn1, &webrtc.SessionDescription{
-					Type: webrtc.SDPTypeAnswer,
+				assert.NoError(t, websocket.JSON.Send(conn1, &sdp{
+					Type: "answer",
 					SDP:  "test",
 				}))
 				assert.Equal(t, MessageTypeAnswer, testutils.MustReceiveChan(t, recv2, 3*time.Second).(*message).Type)
@@ -185,7 +184,7 @@ func TestServer(t *testing.T) {
 				assert.Equal(t, MessageTypeAccept, testutils.MustReceiveChan(t, recv1, 3*time.Second).(*message).Type)
 				assert.NoError(t, websocket.JSON.Send(conn1, &CandidateMessage{
 					Type:         MessageTypeCandidate,
-					ICECandidate: &webrtc.ICECandidateInit{Candidate: "test-candidate"},
+					ICECandidate: &ICECandidateInit{Candidate: "test-candidate"},
 				}))
 
 				conn2, recv2 = tc.dialer.DialClient2(t)
@@ -196,14 +195,14 @@ func TestServer(t *testing.T) {
 				}))
 				assert.Equal(t, MessageTypeAccept, testutils.MustReceiveChan(t, recv2, 3*time.Second).(*message).Type)
 
-				assert.NoError(t, websocket.JSON.Send(conn2, &webrtc.SessionDescription{
-					Type: webrtc.SDPTypeOffer,
+				assert.NoError(t, websocket.JSON.Send(conn2, &sdp{
+					Type: "offer",
 					SDP:  "test",
 				}))
 				assert.Equal(t, MessageTypeCandidate, testutils.MustReceiveChan(t, recv2, 3*time.Second).(*message).Type)
 				assert.Equal(t, MessageTypeOffer, testutils.MustReceiveChan(t, recv1, 3*time.Second).(*message).Type)
-				assert.NoError(t, websocket.JSON.Send(conn1, &webrtc.SessionDescription{
-					Type: webrtc.SDPTypeAnswer,
+				assert.NoError(t, websocket.JSON.Send(conn1, &sdp{
+					Type: "answer",
 					SDP:  "test",
 				}))
 				assert.Equal(t, MessageTypeAnswer, testutils.MustReceiveChan(t, recv2, 3*time.Second).(*message).Type)
@@ -293,4 +292,9 @@ func newTestRedisClient() *redis.Client {
 
 func newRandomRoomID() RoomID {
 	return RoomID(uuid.Must(uuid.NewRandom()).String())
+}
+
+type sdp struct {
+	Type string `json:"type"`
+	SDP  string `json:"sdp"`
 }
