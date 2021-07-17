@@ -1,5 +1,8 @@
 # ayu
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/castaneai/ayu.svg)](https://pkg.go.dev/github.com/castaneai/ayu)
+[![Go Report Card](https://goreportcard.com/badge/github.com/castaneai/ayu)](https://goreportcard.com/report/github.com/castaneai/ayu)
+
 ayu is WebRTC Signaling Server with [ayame](https://github.com/OpenAyame/ayame)-like protocol.
 
 - **Scalable**: ayu uses Redis to store room states, so it can be used on serverless platforms (e.g. Cloud Run).
@@ -10,7 +13,7 @@ ayu is WebRTC Signaling Server with [ayame](https://github.com/OpenAyame/ayame)-
 ## Usage
 
 In the following example, `ws://localhost:8080/signaling` will be the endpoint of the signaling server.
-Please see [ayame-spec](https://github.com/OpenAyame/ayame-spec) for more details on the protocol.
+Please see [ayame-spec](https://github.com/OpenAyame/ayame-spec) for details.
 
 ```go
 package main
