@@ -18,10 +18,10 @@ type Logger interface {
 	Fatalw(template string, keysAndValues ...interface{})
 }
 
-func newDefaultLogger() (*zap.SugaredLogger, error) {
+func NewDefaultLogger() (*zap.SugaredLogger, error) {
 	config := zap.NewDevelopmentConfig()
 	config.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
-	zapLogger, err := config.Build()
+	zapLogger, err := config.Build(zap.AddStacktrace(zap.FatalLevel))
 	if err != nil {
 		return nil, err
 	}

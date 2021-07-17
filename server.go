@@ -8,7 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	authnTimeout         = 10 * time.Second
-	roomOperationTimeout = 10 * time.Second
+	authnTimeout          = 10 * time.Second
+	redisOperationTimeout = 10 * time.Second
 )
 
 var (
@@ -55,30 +55,46 @@ func WithLogger(logger Logger) ServerOption {
 	})
 }
 
+func WithRoomExpiration(expiration time.Duration) ServerOption {
+	return ServerOptionFunc(func(opts *serverOptions) {
+		opts.roomExpiration = expiration
+	})
+}
+
+func WithPingInterval(interval time.Duration) ServerOption {
+	return ServerOptionFunc(func(opts *serverOptions) {
+		opts.pingInterval = interval
+	})
+}
+
 type serverOptions struct {
-	readTimeout  time.Duration
-	writeTimeout time.Duration
-	pingInterval time.Duration
-	pongTimeout  time.Duration
-	logger       Logger
-	authn        Authenticator
+	readTimeout    time.Duration
+	writeTimeout   time.Duration
+	pingInterval   time.Duration
+	pongTimeout    time.Duration
+	logger         Logger
+	authn          Authenticator
+	roomExpiration time.Duration
 }
 
 func defaultServerOptions() *serverOptions {
 	return &serverOptions{
-		readTimeout:  90 * time.Second,
-		writeTimeout: 90 * time.Second,
-		pingInterval: 5 * time.Second,
-		pongTimeout:  60 * time.Second,
-		authn:        &insecureAuthenticator{},
-		logger:       nil,
+		readTimeout:    90 * time.Second,
+		writeTimeout:   90 * time.Second,
+		pingInterval:   5 * time.Second,
+		pongTimeout:    60 * time.Second,
+		authn:          &insecureAuthenticator{},
+		logger:         nil,
+		roomExpiration: 24 * time.Hour,
 	}
 }
 
 type Server struct {
 	logger      Logger
 	opts        *serverOptions
-	roomManager RoomManager
+	roomManager *redisRoomManager
+	conns       map[string]*websocket.Conn
+	mu          sync.RWMutex
 }
 
 func NewServer(redisClient *redis.Client, opts ...ServerOption) *Server {
@@ -88,7 +104,7 @@ func NewServer(redisClient *redis.Client, opts ...ServerOption) *Server {
 	}
 	logger := dopts.logger
 	if logger == nil {
-		lg, err := newDefaultLogger()
+		lg, err := NewDefaultLogger()
 		if err != nil {
 			panic(err)
 		}
@@ -97,7 +113,9 @@ func NewServer(redisClient *redis.Client, opts ...ServerOption) *Server {
 	return &Server{
 		logger:      logger,
 		opts:        dopts,
-		roomManager: newRedisRoomManager(redisClient, logger),
+		roomManager: newRedisRoomManager(redisClient, logger, dopts.roomExpiration),
+		conns:       map[string]*websocket.Conn{},
+		mu:          sync.RWMutex{},
 	}
 }
 
@@ -105,87 +123,142 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	websocket.Handler(s.handle).ServeHTTP(w, r)
 }
 
+func (s *Server) Shutdown() {
+	s.logger.Infof("shutting down server...")
+	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
+	defer cancel()
+	for _, rid := range s.roomManager.managingRooms() {
+		if err := s.roomManager.DeleteRoom(ctx, rid); err != nil {
+			s.logger.Errorw("failed to delete room", "error", err, "room", rid)
+		}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, conn := range s.conns {
+		go s.shutdownConn(conn)
+	}
+}
+
 func (s *Server) handle(conn *websocket.Conn) {
 	defer s.shutdownConn(conn)
+	s.mu.Lock()
+	s.conns[conn.RemoteAddr().String()] = conn
+	s.mu.Unlock()
 
 	client, err := s.authn(conn)
 	if err != nil {
-		s.logger.Errorf("failed to authenticate client: %+v", err)
+		s.logger.Errorw("failed to authenticate client", "error", err)
 		return
 	}
-	defer func() {
-		s.logger.Infof("client closed (roomID: %s, clientID: %s, connectionID: %s)", client.roomID, client.clientID, client.connectionID)
-	}()
-
-	if err := s.joinRoom(client); err != nil {
-		s.logger.Errorf("failed to join room: %+v", err)
+	onRoomMessage, err := s.joinRoom(client)
+	if err != nil {
+		s.logger.Errorw("failed to join room",
+			"error", err, "room", client.roomID, "client", client.clientID)
 		return
 	}
-	s.logger.Infof("client joined (roomID: %s, clientID: %s, connectionID: %s)", client.roomID, client.clientID, client.connectionID)
-	defer func() {
-		if err := s.leaveRoom(client); err != nil {
-			s.logger.Errorf("failed to leave room: %+v", err)
-		}
-		s.logger.Infof("client left (roomID: %s, clientID: %s, connectionID: %s)", client.roomID, client.clientID, client.connectionID)
-	}()
-	recvForwardMessageCh := s.roomManager.SubscribeForwardMessage(client.roomID)
-	leaveCh := s.roomManager.SubscribeLeaveRoom(client.roomID)
+	defer s.leaveRoom(client)
 	pongCh, forwardCh, disconnectedCh := s.startReceive(client)
 	pongTimeoutCh := s.startPingPong(client, pongCh)
 
 	for {
 		select {
 		case <-disconnectedCh:
+			s.logger.Infow("client disconnected",
+				"room", client.roomID, "client", client.clientID)
 			return
 		case <-pongTimeoutCh:
-			s.logger.Warnf("pong timeout(%v)", s.opts.pongTimeout)
-			return
-		case <-leaveCh:
+			s.logger.Warnw("pong timeout",
+				"timeout", s.opts.pongTimeout)
 			return
 		case msg := <-forwardCh:
-			s.forwardCandidateToRoom(client, msg)
-		case msg := <-recvForwardMessageCh:
+			s.forwardToRoom(client, msg)
+		case msg := <-onRoomMessage:
 			if msg.Sender == client.clientID {
 				continue
 			}
-			s.forwardCandidateFromRoom(client, msg.Payload)
+			switch msg.Type {
+			case roomMessageTypeForward:
+				s.forwardFromRoom(client, msg.Payload)
+			case roomMessageTypeLeave:
+				s.logger.Infow("the other client left",
+					"room", client.roomID, "client", client.clientID, "other", msg.Sender)
+				return
+			}
 		}
 	}
 }
 
-func (s *Server) joinRoom(client *clientProxy) error {
-	ctx, cancel := context.WithTimeout(context.Background(), roomOperationTimeout)
+func (s *Server) joinRoom(client *clientProxy) (<-chan *roomMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
 	defer cancel()
-	resp, err := s.roomManager.JoinRoom(ctx, client.roomID, client.clientID)
+
+	lock, err := s.roomManager.BeginRoomLock(ctx, client.roomID)
 	if err != nil {
-		if errors.Is(err, ErrRoomIsFull) {
-			if err := s.writeJSON(client.conn, &RejectMessage{
-				Type:   MessageTypeReject,
-				Reason: "full",
-			}); err != nil {
-				return fmt.Errorf("failed to send reject message: %w", err)
-			}
-		}
-		return fmt.Errorf("failed to join room: %w", err)
+		return nil, fmt.Errorf("failed to begin room lock: %w", err)
 	}
+
+	if len(lock.clientIDs) >= roomMaxMembers {
+		lock.Unlock()
+		if err := s.writeJSON(client.conn, &RejectMessage{
+			Type:   MessageTypeReject,
+			Reason: "full",
+		}); err != nil {
+			return nil, fmt.Errorf("failed to send reject message: %w", err)
+		}
+		return nil, ErrRoomIsFull
+	}
+
+	onRoomMessage, err := s.roomManager.SubscribeMessage(client.roomID, client.clientID)
+	if err != nil {
+		lock.Unlock()
+		return nil, fmt.Errorf("failed to subscribe room: %w", err)
+	}
+
+	otherClientExists := len(lock.clientIDs) > 0
+	if err := s.roomManager.JoinRoom(ctx, client.roomID, client.clientID, otherClientExists); err != nil {
+		lock.Unlock()
+		return nil, fmt.Errorf("failed to join room: %w", err)
+	}
+	lock.Unlock()
+	if otherClientExists {
+		s.logger.Infow("client-two joined", "room", client.roomID, "client", client.clientID)
+	} else {
+		s.logger.Infow("client-one joined", "room", client.roomID, "client", client.clientID)
+	}
+
 	if err := s.writeJSON(client.conn, &AcceptMessage{
 		Type:          MessageTypeAccept,
 		IceServers:    client.iceServers,
-		IsExistClient: resp.OtherClientExists,
-		IsExistUser:   resp.OtherClientExists,
+		IsExistClient: otherClientExists,
+		IsExistUser:   otherClientExists,
 	}); err != nil {
-		return fmt.Errorf("failed to send accept message: %w", err)
+		return nil, fmt.Errorf("failed to send accept message: %w", err)
 	}
-	return nil
+	return onRoomMessage, nil
 }
 
-func (s *Server) leaveRoom(client *clientProxy) error {
-	ctx, cancel := context.WithTimeout(context.Background(), roomOperationTimeout)
+func (s *Server) leaveRoom(client *clientProxy) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
 	defer cancel()
-	if _, err := s.roomManager.LeaveRoom(ctx, client.roomID, client.clientID); err != nil {
-		return err
+
+	lock, err := s.roomManager.BeginRoomLock(ctx, client.roomID)
+	if err != nil {
+		s.logger.Errorw("failed to begin room lock",
+			"error", err, "room", client.roomID, "client", client.clientID)
+		return
 	}
-	return nil
+	defer lock.Unlock()
+
+	otherClientExists := len(lock.clientIDs) > 1
+	if err := s.roomManager.LeaveRoom(ctx, client.roomID, client.clientID, otherClientExists); err != nil {
+		s.logger.Errorw("failed to leave room",
+			"error", err, "room", client.roomID, "client", client.clientID)
+	}
+	if err := s.roomManager.UnsubscribeMessage(client.roomID, client.clientID); err != nil {
+		s.logger.Errorw("failed to unsubscribe",
+			"error", err, "room", client.roomID, "client", client.clientID)
+	}
+	s.logger.Infow("client left", "room", client.roomID, "client", client.clientID)
 }
 
 func (s *Server) authn(conn *websocket.Conn) (*clientProxy, error) {
@@ -193,7 +266,6 @@ func (s *Server) authn(conn *websocket.Conn) (*clientProxy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read register message: %w", err)
 	}
-	s.logger.Debugf("received register: %+v", regMsg)
 	authn := s.opts.authn
 	connID := NewRandomConnectionID()
 	req := &AuthnRequest{
@@ -221,7 +293,8 @@ func (s *Server) authn(conn *websocket.Conn) (*clientProxy, error) {
 		}
 		return nil, ErrUnauthenticated
 	}
-	s.logger.Debugf("authenticated: %+v", authnResponse)
+	s.logger.Debugw("client authenticated",
+		"room", req.RoomID, "client", req.ClientID)
 	return &clientProxy{
 		roomID:       req.RoomID,
 		clientID:     req.ClientID,
@@ -243,42 +316,39 @@ func (s *Server) readRegisterMessage(conn *websocket.Conn) (*RegisterMessage, er
 }
 
 func (s *Server) readJSON(conn *websocket.Conn, v interface{}) error {
-	ctx, cancel := context.WithTimeout(context.Background(), s.opts.readTimeout)
-	defer cancel()
-	return readJSONMessage(ctx, conn, v)
+	return readJSONMessage(conn, v, s.opts.readTimeout)
 }
 
 func (s *Server) writeJSON(conn *websocket.Conn, v interface{}) error {
-	ctx, cancel := context.WithTimeout(context.Background(), s.opts.writeTimeout)
-	defer cancel()
-	return writeJSONMessage(ctx, conn, v)
+	return writeJSONMessage(conn, v, s.opts.writeTimeout)
 }
 
 func (s *Server) writeText(conn *websocket.Conn, v interface{}) error {
-	ctx, cancel := context.WithTimeout(context.Background(), s.opts.writeTimeout)
-	defer cancel()
-	return writeTextMessage(ctx, conn, v)
+	return writeTextMessage(conn, v, s.opts.writeTimeout)
 }
 
 func (s *Server) shutdownConn(conn *websocket.Conn) {
 	if err := s.writeJSON(conn, &ByeMessage{Type: MessageTypeBye}); err != nil {
 		if !isClosedError(err) {
-			s.logger.Errorf("failed to send bye message: %+v", err)
+			s.logger.Errorw("failed to send bye message", "error", err)
 		}
 	}
 	// close code 1000: Normal Closure (RFC 6455)
 	if err := conn.WriteClose(1000); err != nil {
 		if !isClosedError(err) {
-			s.logger.Errorf("failed to send close code: %+v", err)
+			s.logger.Errorw("failed to close websocket conn", "error", err)
 		}
 	}
+	s.mu.Lock()
+	delete(s.conns, conn.RemoteAddr().String())
+	s.mu.Unlock()
 }
 
 func isClosedError(err error) bool {
 	return errors.Is(err, io.EOF) ||
 		errors.Is(err, net.ErrClosed) ||
 		errors.Is(err, syscall.EPIPE) ||
-		strings.Contains(err.Error(), "connection reset by peer")
+		errors.Is(err, syscall.ECONNRESET)
 }
 
 func (s *Server) startPingPong(client *clientProxy, pongCh <-chan *PingPongMessage) <-chan struct{} {
@@ -295,7 +365,7 @@ func (s *Server) startPingPong(client *clientProxy, pongCh <-chan *PingPongMessa
 					if isClosedError(err) {
 						return
 					} else {
-						s.logger.Errorf("failed to send ping message: %+v", err)
+						s.logger.Errorw("failed to send ping message", "error", err)
 					}
 				}
 			case <-pongCh:
@@ -331,14 +401,14 @@ func (s *Server) startReceive(client *clientProxy) (<-chan *PingPongMessage, <-c
 					close(disconnectedCh)
 					return
 				} else {
-					s.logger.Errorf("failed to read message: %+v", err)
+					s.logger.Errorw("failed to read message", "error", err)
 				}
 			}
 			switch msg.Type {
 			case MessageTypePong:
 				var pong PingPongMessage
 				if err := json.Unmarshal(msg.Payload, &pong); err != nil {
-					s.logger.Errorf("failed to unmarshal pong message: %+v", err)
+					s.logger.Errorw("failed to unmarshal pong message", "error", err)
 					continue
 				}
 				pongCh <- &pong
@@ -352,62 +422,46 @@ func (s *Server) startReceive(client *clientProxy) (<-chan *PingPongMessage, <-c
 	return pongCh, forwardCh, disconnectedCh
 }
 
-func (s *Server) forwardCandidateToRoom(sender *clientProxy, msg *message) {
-	ctx, cancel := context.WithTimeout(context.Background(), roomOperationTimeout)
+func (s *Server) forwardToRoom(sender *clientProxy, msg *message) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
 	defer cancel()
-	if err := s.roomManager.ForwardMessage(ctx, sender.roomID, &roomMessage{
+	if err := s.roomManager.PublishMessage(ctx, sender.roomID, &roomMessage{
 		Sender:  sender.clientID,
 		Type:    roomMessageTypeForward,
 		Payload: string(msg.Payload),
 	}); err != nil {
-		s.logger.Errorf("failed to forward candidate message to room: %+v", err)
-		return
+		s.logger.Errorf("failed to forward message to room: %+v", err)
 	}
-	s.logger.Infof("forwarding: %+v", string(msg.Payload))
 }
 
-func (s *Server) forwardCandidateFromRoom(receiver *clientProxy, payload string) {
+func (s *Server) forwardFromRoom(receiver *clientProxy, payload string) {
 	if err := s.writeText(receiver.conn, payload); err != nil {
 		s.logger.Errorf("failed to forward candidate message from room: %+v", err)
 	}
 }
 
-func readJSONMessage(ctx context.Context, conn *websocket.Conn, v interface{}) error {
-	result := make(chan error)
-	go func() {
-		result <- websocket.JSON.Receive(conn, v)
-	}()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-result:
-		if err != nil {
-			return err
-		}
-		return nil
+func readMessage(conn *websocket.Conn, v interface{}, codec websocket.Codec, timeout time.Duration) error {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("failed to set read deadline: %w", err)
 	}
+	return codec.Receive(conn, v)
 }
 
-func writeMessage(ctx context.Context, conn *websocket.Conn, v interface{}, codec websocket.Codec) error {
-	result := make(chan error)
-	go func() {
-		result <- codec.Send(conn, v)
-	}()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-result:
-		if err != nil {
-			return err
-		}
-		return nil
+func readJSONMessage(conn *websocket.Conn, v interface{}, timeout time.Duration) error {
+	return readMessage(conn, v, websocket.JSON, timeout)
+}
+
+func writeMessage(conn *websocket.Conn, v interface{}, codec websocket.Codec, timeout time.Duration) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("failed to set write deadline: %w", err)
 	}
+	return codec.Send(conn, v)
 }
 
-func writeJSONMessage(ctx context.Context, conn *websocket.Conn, v interface{}) error {
-	return writeMessage(ctx, conn, v, websocket.JSON)
+func writeJSONMessage(conn *websocket.Conn, v interface{}, timeout time.Duration) error {
+	return writeMessage(conn, v, websocket.JSON, timeout)
 }
 
-func writeTextMessage(ctx context.Context, conn *websocket.Conn, v interface{}) error {
-	return writeMessage(ctx, conn, v, websocket.Message)
+func writeTextMessage(conn *websocket.Conn, v interface{}, timeout time.Duration) error {
+	return writeMessage(conn, v, websocket.Message, timeout)
 }

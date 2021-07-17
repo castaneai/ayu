@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	roomMaxMembers     = 2
-	roomLockExpiration = 30 * time.Second
+	roomMaxMembers          = 2
+	roomLockExpiration      = 30 * time.Second
+	subscribeChannelBufSize = 50
 )
 
 type roomMessageType string
@@ -27,22 +28,6 @@ const (
 var (
 	ErrRoomIsFull = errors.New("room is full")
 )
-
-type RoomManager interface {
-	JoinRoom(ctx context.Context, roomID RoomID, clientID ClientID) (*joinRoomResponse, error)
-	LeaveRoom(ctx context.Context, roomID RoomID, clientID ClientID) (*leaveRoomResponse, error)
-	ForwardMessage(ctx context.Context, roomID RoomID, rm *roomMessage) error
-	SubscribeForwardMessage(roomID RoomID) <-chan *roomMessage
-	SubscribeLeaveRoom(roomID RoomID) <-chan struct{}
-}
-
-type joinRoomResponse struct {
-	OtherClientExists bool
-}
-
-type leaveRoomResponse struct {
-	OtherClientExists bool
-}
 
 type roomMessage struct {
 	Sender  ClientID        `json:"sender"`
@@ -63,89 +48,144 @@ func redisRoomPubSubKey(roomID RoomID) string {
 }
 
 type redisRoom struct {
-	client         *redis.Client
-	roomID         RoomID
-	lock           *redisMutex
-	mu             sync.Mutex
-	full           bool
-	forwardSendBuf []*roomMessage
-	recvForwardCh  chan *roomMessage
-	leaveCh        chan struct{}
-	stopSub        context.CancelFunc
-	logger         Logger
+	client      *redis.Client
+	roomID      RoomID
+	lock        *redisMutex    // Locking by SETNX is used for transactional updating of the room member list.
+	publishBuf  *publishBuffer // The forward message sent before the other client connects should be buffered.
+	subscribers map[ClientID]chan *roomMessage
+	mu          sync.RWMutex // to protect subscribers map
+	stopSub     context.CancelFunc
+	logger      Logger
+	expiration  time.Duration
 }
 
-func newRedisRoom(client *redis.Client, roomID RoomID, logger Logger) *redisRoom {
-	forwardCh := make(chan *roomMessage, 100)
-	leaveCh := make(chan struct{})
+func newRedisRoom(client *redis.Client, roomID RoomID, logger Logger, expiration time.Duration) (*redisRoom, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	room := &redisRoom{
-		client:        client,
-		roomID:        roomID,
-		lock:          newRedisMutex(client, redisRoomLockKey(roomID), roomLockExpiration, roomOperationTimeout),
-		mu:            sync.Mutex{},
-		full:          false,
-		recvForwardCh: forwardCh,
-		leaveCh:       leaveCh,
-		stopSub:       cancel,
-		logger:        logger,
+		client:      client,
+		roomID:      roomID,
+		lock:        newRedisMutex(client, redisRoomLockKey(roomID), roomLockExpiration, redisOperationTimeout),
+		publishBuf:  newPublishBuffer(),
+		subscribers: map[ClientID]chan *roomMessage{},
+		mu:          sync.RWMutex{},
+		stopSub:     cancel,
+		logger:      logger,
+		expiration:  expiration,
 	}
+	subscribeOpened := make(chan struct{})
 	go func() {
-		subCh := client.Subscribe(ctx, redisRoomPubSubKey(roomID)).Channel()
+		sub := client.Subscribe(ctx, redisRoomPubSubKey(roomID))
+		go func() {
+			<-ctx.Done()
+			rctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
+			defer cancel()
+			if err := sub.Unsubscribe(rctx, redisRoomPubSubKey(roomID)); err != nil {
+				logger.Errorw("failed to unsubscribe redis pub/sub", "error", err, "room", roomID)
+			}
+			logger.Debugw("closing redis pub/sub subscription", "room", roomID)
+			if err := sub.Close(); err != nil {
+				logger.Errorw("failed to close redis pub/sub", "error", err, "room", roomID)
+			}
+		}()
+		var once sync.Once
 		for {
-			select {
-			case <-ctx.Done():
+			recv, err := sub.Receive(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					room.logger.Errorw("failed to subscribe from redis", "error", err, "room", room.roomID)
+				}
 				return
-			case m := <-subCh:
+			}
+			switch m := recv.(type) {
+			case *redis.Subscription:
+				once.Do(func() { close(subscribeOpened) })
+			case *redis.Message:
 				var rm roomMessage
 				if err := json.Unmarshal([]byte(m.Payload), &rm); err != nil {
-					logger.Errorf("failed to unmarshal subscribed room message: %+v", err)
-					return
+					logger.Errorw("failed to unmarshal subscribed room message",
+						"error", err, "room", room.roomID)
+					continue
 				}
-				room.handleRoomMessage(&rm, forwardCh, leaveCh)
+				go room.handleRoomMessage(&rm)
+			case *redis.Pong:
+				// ignore
+			default:
+				logger.Warnf("unknown message received from pub/sub", "message", m)
 			}
 		}
 	}()
-	return room
+	select {
+	case <-subscribeOpened:
+		return room, nil
+	case <-time.After(redisOperationTimeout):
+		return nil, fmt.Errorf("opening pub/sub subscription timeout(%v)", redisOperationTimeout)
+	}
 }
 
-func (r *redisRoom) join(ctx context.Context, clientID ClientID) (*joinRoomResponse, error) {
+func (r *redisRoom) join(ctx context.Context, clientID ClientID, otherClientExists bool) error {
+	key := redisRoomMembersKey(r.roomID)
+	if _, err := r.client.SAdd(ctx, key, string(clientID)).Result(); err != nil {
+		return fmt.Errorf("failed to exec SADD for %s: %w", key, err)
+	}
+	// If the other client is present in the room, we will notify them of our participation.
+	if otherClientExists {
+		if err := r.publishMessages(ctx, []*roomMessage{
+			{Sender: clientID, Type: roomMessageTypeJoin},
+		}, otherClientExists); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type roomLock struct {
+	clientIDs []ClientID
+	unlock    func()
+}
+
+func (t *roomLock) Unlock() {
+	t.unlock()
+}
+
+func (r *redisRoom) beginLock(ctx context.Context) (*roomLock, error) {
 	if err := r.lock.Lock(); err != nil {
 		return nil, err
 	}
-	defer func() { _ = r.lock.Unlock() }()
-
-	clientIDs, err := r.client.SMembers(ctx, redisRoomMembersKey(r.roomID)).Result()
+	key := redisRoomMembersKey(r.roomID)
+	members, err := r.client.SMembers(ctx, key).Result()
 	if err != nil {
-		return nil, fmt.Errorf("failed to exec SMEMBERS for %s: %w", redisRoomMembersKey(r.roomID), err)
+		return nil, fmt.Errorf("failed to exec SMEMBERS for %s: %w", key, err)
 	}
-	if len(clientIDs) >= roomMaxMembers {
-		return nil, ErrRoomIsFull
+	if _, err := r.client.Expire(ctx, key, r.expiration).Result(); err != nil {
+		return nil, fmt.Errorf("failed to exec EXPIRE for %s: %w", key, err)
 	}
-	otherClientExists := len(clientIDs) > 0
-
-	if _, err := r.client.SAdd(ctx, redisRoomMembersKey(r.roomID), string(clientID)).Result(); err != nil {
-		return nil, err
+	var clientIDs []ClientID
+	for _, m := range members {
+		clientIDs = append(clientIDs, ClientID(m))
 	}
-	if otherClientExists {
-		r.mu.Lock()
-		r.full = true
-		r.mu.Unlock()
-	}
-	if err := r.publishRoomMessage(ctx, &roomMessage{
-		Sender: clientID,
-		Type:   roomMessageTypeJoin,
-	}); err != nil {
-		return nil, err
-	}
-	return &joinRoomResponse{OtherClientExists: otherClientExists}, nil
+	return &roomLock{
+		clientIDs: clientIDs,
+		unlock: func() {
+			if err := r.lock.Unlock(); err != nil {
+				r.logger.Errorw("failed to unlock room", "error", err, "room", r.roomID)
+			}
+		},
+	}, nil
 }
 
-func (r *redisRoom) publishRoomMessage(ctx context.Context, rm *roomMessage) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+func (r *redisRoom) publishMessages(ctx context.Context, rms []*roomMessage, otherClientExists bool) error {
+	if !otherClientExists {
+		for _, rm := range rms {
+			if rm.Type == roomMessageTypeForward {
+				r.publishBuf.Add(rm)
+				r.logger.Debugw("buffered", "message", rm)
+			}
+		}
+		return nil
+	}
 
-	publish := func(rm *roomMessage) error {
+	rms = append(r.publishBuf.Flush(), rms...)
+	for _, rm := range rms {
 		b, err := json.Marshal(rm)
 		if err != nil {
 			return fmt.Errorf("failed to marshal room message: %w", err)
@@ -153,111 +193,207 @@ func (r *redisRoom) publishRoomMessage(ctx context.Context, rm *roomMessage) err
 		if _, err := r.client.Publish(ctx, redisRoomPubSubKey(r.roomID), string(b)).Result(); err != nil {
 			return fmt.Errorf("failed to publish room message: %w", err)
 		}
-		return nil
-	}
-	if r.full {
-		for _, rm := range r.forwardSendBuf {
-			if err := publish(rm); err != nil {
-				return err
-			}
-		}
-		r.forwardSendBuf = nil
-		return publish(rm)
-	}
-	if rm.Type == roomMessageTypeForward {
-		r.forwardSendBuf = append(r.forwardSendBuf, rm)
+		r.logger.Debugw("published", "message", rm)
 	}
 	return nil
 }
 
-func (r *redisRoom) handleRoomMessage(rm *roomMessage, forwardCh chan<- *roomMessage, leaveCh chan<- struct{}) {
+func (r *redisRoom) handleRoomMessage(rm *roomMessage) {
 	switch rm.Type {
 	case roomMessageTypeJoin:
-		r.mu.Lock()
-		r.full = true
-		r.mu.Unlock()
+		r.logger.Debugw("two clients joined in the room",
+			"room", r.roomID)
+		ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
+		defer cancel()
+		lock, err := r.beginLock(ctx)
+		if err != nil {
+			r.logger.Errorw("failed to begin room lock", "error", err, "room", r.roomID)
+			return
+		}
+		defer lock.Unlock()
+		otherClientExists := len(lock.clientIDs) > 1
+		if err := r.publishMessages(ctx, nil, otherClientExists); err != nil {
+			r.logger.Errorw("failed to publish buffered messages", "error", err)
+		}
 	case roomMessageTypeLeave:
-		r.mu.Lock()
-		r.full = false
-		r.mu.Unlock()
-		close(leaveCh)
 	case roomMessageTypeForward:
-		forwardCh <- rm
 	default:
-		r.logger.Warnf("unknown forward message type received: '%s'", rm.Type)
+		r.logger.Warnw("unknown forward message type received",
+			"message", rm, "room", r.roomID)
+		return
 	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var targets []ClientID
+	for target, sub := range r.subscribers {
+		targets = append(targets, target)
+		select {
+		case sub <- rm:
+		default:
+			r.logger.Warnw("failed to forward message from room (channel is full)",
+				"message", rm, "target", target)
+		}
+	}
+	r.logger.Debugw("received forward", "targets", targets, "message", rm)
 }
 
-func (r *redisRoom) leave(ctx context.Context, clientID ClientID) (*leaveRoomResponse, error) {
-	defer r.stopSub()
-	if err := r.lock.Lock(); err != nil {
-		return nil, err
+func (r *redisRoom) leave(ctx context.Context, clientID ClientID, otherClientExists bool) error {
+	if otherClientExists {
+		if err := r.publishMessages(ctx, []*roomMessage{
+			{Sender: clientID, Type: roomMessageTypeLeave},
+		}, otherClientExists); err != nil {
+			return err
+		}
 	}
-	defer func() { _ = r.lock.Unlock() }()
-
 	if _, err := r.client.SRem(ctx, redisRoomMembersKey(r.roomID), string(clientID)).Result(); err != nil {
-		return nil, fmt.Errorf("failed to exec SREM for %s: %w", redisRoomMembersKey(r.roomID), err)
+		return fmt.Errorf("failed to exec SREM for %s: %w", redisRoomMembersKey(r.roomID), err)
 	}
+	return nil
+}
 
-	clientIDs, err := r.client.SMembers(ctx, redisRoomMembersKey(r.roomID)).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to exec SMEMBERS for %s: %w", redisRoomMembersKey(r.roomID), err)
+func (r *redisRoom) subscribeRoomMessage(clientID ClientID) <-chan *roomMessage {
+	subCh := make(chan *roomMessage, subscribeChannelBufSize)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.subscribers[clientID] = subCh
+	r.logger.Debugw("subscribe", "room", r.roomID, "client", clientID)
+	return subCh
+}
+
+func (r *redisRoom) unsubscribeRoomMessage(clientID ClientID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.subscribers, clientID)
+	r.logger.Debugw("unsubscribe", "room", r.roomID, "client", clientID)
+}
+
+func (r *redisRoom) delete(ctx context.Context) error {
+	r.stopSub()
+	if _, err := r.client.Del(ctx, redisRoomMembersKey(r.roomID)).Result(); err != nil {
+		return err
 	}
-	otherClientExists := len(clientIDs) > 0
-	if err := r.publishRoomMessage(ctx, &roomMessage{
-		Sender: clientID,
-		Type:   roomMessageTypeLeave,
-	}); err != nil {
-		return nil, err
-	}
-	return &leaveRoomResponse{OtherClientExists: otherClientExists}, nil
+	r.logger.Infow("room deleted", "room", r.roomID)
+	return nil
 }
 
 type redisRoomManager struct {
-	client *redis.Client
-	rooms  map[RoomID]*redisRoom
-	mu     sync.Mutex
-	logger Logger
+	client         *redis.Client
+	rooms          map[RoomID]*redisRoom
+	mu             sync.Mutex
+	logger         Logger
+	roomExpiration time.Duration
 }
 
-func newRedisRoomManager(client *redis.Client, logger Logger) *redisRoomManager {
+func newRedisRoomManager(client *redis.Client, logger Logger, roomExpiration time.Duration) *redisRoomManager {
 	return &redisRoomManager{
-		client: client,
-		rooms:  map[RoomID]*redisRoom{},
-		mu:     sync.Mutex{},
-		logger: logger,
+		client:         client,
+		rooms:          map[RoomID]*redisRoom{},
+		mu:             sync.Mutex{},
+		logger:         logger,
+		roomExpiration: roomExpiration,
 	}
 }
 
-func (m *redisRoomManager) JoinRoom(ctx context.Context, roomID RoomID, clientID ClientID) (*joinRoomResponse, error) {
-	return m.getRoom(roomID).join(ctx, clientID)
+func (m *redisRoomManager) JoinRoom(ctx context.Context, roomID RoomID, clientID ClientID, otherClientExists bool) error {
+	room, err := m.getRoom(roomID)
+	if err != nil {
+		return err
+	}
+	return room.join(ctx, clientID, otherClientExists)
 }
 
-func (m *redisRoomManager) LeaveRoom(ctx context.Context, roomID RoomID, clientID ClientID) (*leaveRoomResponse, error) {
-	return m.getRoom(roomID).leave(ctx, clientID)
+func (m *redisRoomManager) LeaveRoom(ctx context.Context, roomID RoomID, clientID ClientID, otherClientExists bool) error {
+	room, err := m.getRoom(roomID)
+	if err != nil {
+		return err
+	}
+	if err := room.leave(ctx, clientID, otherClientExists); err != nil {
+		return err
+	}
+	if !otherClientExists {
+		if err := m.DeleteRoom(ctx, roomID); err != nil {
+			return fmt.Errorf("failed to delete room: %w", err)
+		}
+	}
+	return nil
 }
 
-func (m *redisRoomManager) ForwardMessage(ctx context.Context, roomID RoomID, rm *roomMessage) error {
-	return m.getRoom(roomID).publishRoomMessage(ctx, rm)
+func (m *redisRoomManager) DeleteRoom(ctx context.Context, roomID RoomID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	room, ok := m.rooms[roomID]
+	if !ok {
+		return nil
+	}
+	defer delete(m.rooms, roomID)
+	if err := room.delete(ctx); err != nil {
+		return err
+	}
+	return nil
 }
 
-func (m *redisRoomManager) SubscribeForwardMessage(roomID RoomID) <-chan *roomMessage {
-	return m.getRoom(roomID).recvForwardCh
+func (m *redisRoomManager) managingRooms() []RoomID {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var roomIDs []RoomID
+	for rid, _ := range m.rooms {
+		roomIDs = append(roomIDs, rid)
+	}
+	return roomIDs
 }
 
-func (m *redisRoomManager) SubscribeLeaveRoom(roomID RoomID) <-chan struct{} {
-	return m.getRoom(roomID).leaveCh
+func (m *redisRoomManager) PublishMessage(ctx context.Context, roomID RoomID, rm *roomMessage) error {
+	room, err := m.getRoom(roomID)
+	if err != nil {
+		return err
+	}
+	lock, err := room.beginLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer lock.Unlock()
+	otherClientExists := len(lock.clientIDs) > 1
+	return room.publishMessages(ctx, []*roomMessage{rm}, otherClientExists)
 }
 
-func (m *redisRoomManager) getRoom(roomID RoomID) *redisRoom {
+func (m *redisRoomManager) SubscribeMessage(roomID RoomID, clientID ClientID) (<-chan *roomMessage, error) {
+	room, err := m.getRoom(roomID)
+	if err != nil {
+		return nil, err
+	}
+	return room.subscribeRoomMessage(clientID), nil
+}
+
+func (m *redisRoomManager) UnsubscribeMessage(roomID RoomID, clientID ClientID) error {
+	room, err := m.getRoom(roomID)
+	if err != nil {
+		return err
+	}
+	room.unsubscribeRoomMessage(clientID)
+	return nil
+}
+
+func (m *redisRoomManager) BeginRoomLock(ctx context.Context, roomID RoomID) (*roomLock, error) {
+	room, err := m.getRoom(roomID)
+	if err != nil {
+		return nil, err
+	}
+	return room.beginLock(ctx)
+}
+
+func (m *redisRoomManager) getRoom(roomID RoomID) (*redisRoom, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	room, ok := m.rooms[roomID]
 	if ok {
-		return room
+		return room, nil
 	}
-	m.rooms[roomID] = newRedisRoom(m.client, roomID, m.logger)
-	return m.rooms[roomID]
+	room, err := newRedisRoom(m.client, roomID, m.logger, m.roomExpiration)
+	if err != nil {
+		return nil, err
+	}
+	m.rooms[roomID] = room
+	return room, nil
 }
 
 type redisMutex struct {
@@ -298,4 +434,30 @@ func (m *redisMutex) Unlock() error {
 		return err
 	}
 	return nil
+}
+
+type publishBuffer struct {
+	buf []*roomMessage
+	mu  sync.Mutex
+}
+
+func newPublishBuffer() *publishBuffer {
+	return &publishBuffer{
+		buf: nil,
+		mu:  sync.Mutex{},
+	}
+}
+
+func (b *publishBuffer) Add(rms ...*roomMessage) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf = append(b.buf, rms...)
+}
+
+func (b *publishBuffer) Flush() []*roomMessage {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	rms := b.buf
+	b.buf = nil
+	return rms
 }

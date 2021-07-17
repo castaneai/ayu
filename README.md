@@ -16,10 +16,8 @@ Please see [ayame-spec](https://github.com/OpenAyame/ayame-spec) for more detail
 package main
 
 import (
-	"fmt"
 	"log"
 	"net/http"
-	"os"
 
 	"github.com/castaneai/ayu"
 	"github.com/go-redis/redis/v8"
@@ -28,12 +26,10 @@ import (
 func main() {
 	redisClient := redis.NewClient(&redis.Options{Addr: "x.x.x.x:6379"})
 	sv := ayu.NewServer(redisClient)
+	defer sv.Shutdown()
 	http.Handle("/signaling", sv)
 
 	addr := ":8080"
-	if p := os.Getenv("PORT"); p != "" {
-		addr = fmt.Sprintf(":%s", p)
-	}
 	log.Printf("listening on %s...", addr)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
