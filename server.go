@@ -22,8 +22,7 @@ const (
 )
 
 var (
-	// ErrUnauthenticated is returned when the authentication fails.
-	ErrUnauthenticated = errors.New("unauthenticated")
+	errUnauthenticated = errors.New("unauthenticated")
 )
 
 type clientProxy struct {
@@ -296,7 +295,7 @@ func (s *Server) authn(conn *websocket.Conn) (*clientProxy, error) {
 		}); err != nil {
 			return nil, fmt.Errorf("failed to send reject message: %w", err)
 		}
-		return nil, ErrUnauthenticated
+		return nil, errUnauthenticated
 	}
 	s.logger.Debugf("client authenticated (room: %s, client: %s)", req.RoomID, req.ClientID)
 	return &clientProxy{

@@ -4,10 +4,13 @@ import (
 	"context"
 )
 
+// Authenticator is a authentication logic for joining the room.
 type Authenticator interface {
+	// Authenticate authenticates a client joining the room.
 	Authenticate(ctx context.Context, req *AuthnRequest) (*AuthnResponse, error)
 }
 
+// AuthnRequest is a request for Authenticator.
 type AuthnRequest struct {
 	RoomID        RoomID
 	ClientID      ClientID
@@ -15,6 +18,7 @@ type AuthnRequest struct {
 	AuthnMetadata map[string]interface{}
 }
 
+// AuthnResponse is a response for Authenticator.
 type AuthnResponse struct {
 	Allowed       bool
 	Reason        string
