@@ -173,8 +173,14 @@ func (s *Server) handle(conn *websocket.Conn) {
 		delete(s.clients, client.clientID)
 	}()
 
-	onRoomMessage, err := s.register(client)
+	onRoomMessage, err := s.pubsubManager.Subscribe(client.roomID, client.clientID)
 	if err != nil {
+		s.logger.Errorf("failed to subscribe (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
+		return
+	}
+	defer s.pubsubManager.Unsubscribe(client.roomID, client.clientID)
+
+	if err := s.register(client); err != nil {
 		s.logger.Errorf("failed to register (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
 		return
 	}
@@ -208,13 +214,13 @@ func (s *Server) handle(conn *websocket.Conn) {
 	}
 }
 
-func (s *Server) register(client *clientProxy) (<-chan *roomMessage, error) {
+func (s *Server) register(client *clientProxy) error {
 	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
 	defer cancel()
 
 	lock, err := s.roomManager.BeginRoomLock(client.roomID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin room lock: %w", err)
+		return fmt.Errorf("failed to begin room lock: %w", err)
 	}
 
 	otherClientExists, err := s.roomManager.JoinRoom(ctx, client.roomID, client.clientID)
@@ -225,22 +231,18 @@ func (s *Server) register(client *clientProxy) (<-chan *roomMessage, error) {
 				Type:   MessageTypeReject,
 				Reason: "full",
 			}); err != nil {
-				return nil, fmt.Errorf("failed to send reject message: %w", err)
+				return fmt.Errorf("failed to send reject message: %w", err)
 			}
 		}
-		return nil, err
+		return err
 	}
-	onRoomMessage, err := s.pubsubManager.Subscribe(client.roomID, client.clientID)
-	if err != nil {
-		lock.Unlock()
-		return nil, fmt.Errorf("failed to subscribe room: %w", err)
-	}
+
 	if err := s.forwarder.Forward(ctx, client.roomID, &roomMessage{
 		Sender: client.clientID,
 		Type:   roomMessageTypeJoin,
 	}, otherClientExists); err != nil {
 		lock.Unlock()
-		return nil, fmt.Errorf("failed to publish join message: %w", err)
+		return fmt.Errorf("failed to publish join message: %w", err)
 	}
 	lock.Unlock()
 
@@ -256,9 +258,9 @@ func (s *Server) register(client *clientProxy) (<-chan *roomMessage, error) {
 		IsExistClient: otherClientExists,
 		IsExistUser:   otherClientExists,
 	}); err != nil {
-		return nil, fmt.Errorf("failed to send accept message: %w", err)
+		return fmt.Errorf("failed to send accept message: %w", err)
 	}
-	return onRoomMessage, nil
+	return nil
 }
 
 func (s *Server) unregister(client *clientProxy) {
