@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,7 +91,11 @@ func TestServer(t *testing.T) {
 					RoomID:   roomID,
 					ClientID: "client3",
 				}))
-				assert.Equal(t, MessageTypeReject, testutils.MustReceiveChan(t, recv3, 3*time.Second).(*message).Type)
+				msg := testutils.MustReceiveChan(t, recv3, 3*time.Second).(*message)
+				assert.Equal(t, MessageTypeReject, msg.Type)
+				var rj RejectMessage
+				mustUnpackMessage(t, msg, &rj)
+				assert.Equal(t, "full", rj.Reason)
 			})
 
 			t.Run("signaling", func(t *testing.T) {
@@ -150,7 +155,7 @@ func TestServer(t *testing.T) {
 				// active close by client1
 				assert.NoError(t, conn1.Close())
 
-				// When the other client leaves the room, the room is destroyed and bye is received.
+				// When the other client unregistered, the room is destroyed and bye is received.
 				assert.Equal(t, MessageTypeBye, testutils.MustReceiveChan(t, recv2, 3*time.Second).(*message).Type)
 			})
 
@@ -206,6 +211,71 @@ func TestServer(t *testing.T) {
 					SDP:  "test",
 				}))
 				assert.Equal(t, MessageTypeAnswer, testutils.MustReceiveChan(t, recv2, 3*time.Second).(*message).Type)
+			})
+
+			t.Run("multi rooms", func(t *testing.T) {
+				type roomCase struct {
+					roomID    RoomID
+					client1ID ClientID
+					client2ID ClientID
+				}
+				roomCases := []roomCase{
+					{roomID: newRandomRoomID(), client1ID: "client1-1", client2ID: "client1-2"},
+					{roomID: newRandomRoomID(), client1ID: "client2-1", client2ID: "client2-2"},
+				}
+				var wg sync.WaitGroup
+				for _, rc := range roomCases {
+					wg.Add(1)
+					go func(rc roomCase) {
+						defer wg.Done()
+						conn1, recv1 := tc.dialer.DialClient1(t)
+						assert.NoError(t, websocket.JSON.Send(conn1, &RegisterMessage{
+							Type:     MessageTypeRegister,
+							RoomID:   rc.roomID,
+							ClientID: rc.client1ID,
+						}))
+						assert.Equal(t, MessageTypeAccept, testutils.MustReceiveChan(t, recv1, 3*time.Second).(*message).Type)
+						assert.NoError(t, websocket.JSON.Send(conn1, &CandidateMessage{
+							Type:         MessageTypeCandidate,
+							ICECandidate: &ICECandidateInit{Candidate: string(rc.roomID)},
+						}))
+
+						conn2, recv2 := tc.dialer.DialClient2(t)
+						assert.NoError(t, websocket.JSON.Send(conn2, &RegisterMessage{
+							Type:     MessageTypeRegister,
+							RoomID:   rc.roomID,
+							ClientID: rc.client2ID,
+						}))
+						assert.Equal(t, MessageTypeAccept, testutils.MustReceiveChan(t, recv2, 3*time.Second).(*message).Type)
+
+						assert.NoError(t, websocket.JSON.Send(conn2, &sdp{
+							Type: "offer",
+							SDP:  string(rc.roomID),
+						}))
+						msg := testutils.MustReceiveChan(t, recv2, 3*time.Second).(*message)
+						assert.Equal(t, MessageTypeCandidate, msg.Type)
+						var cand CandidateMessage
+						mustUnpackMessage(t, msg, &cand)
+						assert.Equal(t, string(rc.roomID), cand.ICECandidate.Candidate)
+
+						msg = testutils.MustReceiveChan(t, recv1, 3*time.Second).(*message)
+						assert.Equal(t, MessageTypeOffer, msg.Type)
+						var offer sdp
+						mustUnpackMessage(t, msg, &offer)
+						assert.Equal(t, string(rc.roomID), offer.SDP)
+
+						assert.NoError(t, websocket.JSON.Send(conn1, &sdp{
+							Type: "answer",
+							SDP:  string(rc.roomID),
+						}))
+						msg = testutils.MustReceiveChan(t, recv2, 3*time.Second).(*message)
+						assert.Equal(t, MessageTypeAnswer, msg.Type)
+						var answer sdp
+						mustUnpackMessage(t, msg, &answer)
+						assert.Equal(t, string(rc.roomID), answer.SDP)
+					}(rc)
+				}
+				wg.Wait()
 			})
 		})
 	}

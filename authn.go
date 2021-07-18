@@ -4,9 +4,9 @@ import (
 	"context"
 )
 
-// Authenticator is a authentication logic for joining the room.
+// Authenticator is a authentication logic for registration.
 type Authenticator interface {
-	// Authenticate authenticates a client joining the room.
+	// Authenticate authenticates a client registration.
 	Authenticate(ctx context.Context, req *AuthnRequest) (*AuthnResponse, error)
 }
 

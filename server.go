@@ -44,7 +44,7 @@ func (f serverOptionFunc) apply(opts *serverOptions) {
 	f(opts)
 }
 
-// WithAuthenticator specifies the custom authentication for joining the room.
+// WithAuthenticator specifies the custom authentication for registration.
 func WithAuthenticator(authn Authenticator) ServerOption {
 	return serverOptionFunc(func(opts *serverOptions) {
 		opts.authn = authn
@@ -96,11 +96,13 @@ func defaultServerOptions() *serverOptions {
 
 // Server is a server of ayu.
 type Server struct {
-	logger      Logger
-	opts        *serverOptions
-	roomManager *redisRoomManager
-	conns       map[string]*websocket.Conn
-	mu          sync.RWMutex
+	logger        Logger
+	opts          *serverOptions
+	roomManager   *redisRoomManager
+	pubsubManager *redisPubSubManager
+	forwarder     *forwarder
+	clients       map[ClientID]*clientProxy
+	mu            sync.RWMutex
 }
 
 // NewServer creates a new ayu server.
@@ -117,12 +119,17 @@ func NewServer(redisClient *redis.Client, opts ...ServerOption) *Server {
 		}
 		logger = lg
 	}
+	roomManager := newRedisRoomManager(redisClient, logger, dopts.roomExpiration)
+	pubsubManager := newRedisPubSubManager(redisClient, logger)
+	forwarder := newForwarder(pubsubManager, logger)
 	return &Server{
-		logger:      logger,
-		opts:        dopts,
-		roomManager: newRedisRoomManager(redisClient, logger, dopts.roomExpiration),
-		conns:       map[string]*websocket.Conn{},
-		mu:          sync.RWMutex{},
+		logger:        logger,
+		opts:          dopts,
+		roomManager:   roomManager,
+		pubsubManager: pubsubManager,
+		forwarder:     forwarder,
+		clients:       map[ClientID]*clientProxy{},
+		mu:            sync.RWMutex{},
 	}
 }
 
@@ -135,34 +142,40 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // When Shutdown is called, all connections (WebSocket and Redis) will be forcibly disconnected.
 func (s *Server) Shutdown() {
 	s.logger.Infof("shutting down server...")
-	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
-	defer cancel()
-	for _, rid := range s.roomManager.managingRooms() {
-		if err := s.roomManager.DeleteRoom(ctx, rid); err != nil {
-			s.logger.Errorf("failed to delete room(%s): %+v", rid, err)
-		}
-	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, conn := range s.conns {
-		go s.shutdownConn(conn)
+	var wg sync.WaitGroup
+	for _, client := range s.clients {
+		wg.Add(1)
+		go func(c *clientProxy) {
+			defer wg.Done()
+			s.unregister(c)
+			s.shutdownConn(c.conn)
+		}(client)
 	}
+	wg.Wait()
 }
 
 func (s *Server) handle(conn *websocket.Conn) {
 	defer s.shutdownConn(conn)
-	s.mu.Lock()
-	s.conns[conn.RemoteAddr().String()] = conn
-	s.mu.Unlock()
 
 	client, err := s.authn(conn)
 	if err != nil {
 		s.logger.Errorf("failed to authenticate client: %+v", err)
 		return
 	}
-	onRoomMessage, err := s.joinRoom(client)
+	s.mu.Lock()
+	s.clients[client.clientID] = client
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		delete(s.clients, client.clientID)
+	}()
+
+	onRoomMessage, err := s.register(client)
 	if err != nil {
-		s.logger.Errorf("failed to join room(room: %s, client: %s): %+v", client.roomID, client.clientID, err)
+		s.logger.Errorf("failed to register (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
 		return
 	}
 	pongCh, forwardCh, disconnectedCh := s.startReceive(client)
@@ -171,24 +184,23 @@ func (s *Server) handle(conn *websocket.Conn) {
 	for {
 		select {
 		case <-disconnectedCh:
-			s.leaveRoom(client)
+			s.unregister(client)
 			s.logger.Infof("client disconnected (room: %s, client: %s)", client.roomID, client.clientID)
 			return
 		case <-pongTimeoutCh:
-			s.leaveRoom(client)
+			s.unregister(client)
 			s.logger.Warnf("pong timeout (%v)", s.opts.pongTimeout)
 			return
 		case msg := <-forwardCh:
 			s.forwardToRoom(client, msg)
 		case msg := <-onRoomMessage:
-			if msg.Sender == client.clientID {
-				continue
-			}
 			switch msg.Type {
 			case roomMessageTypeForward:
 				s.forwardFromRoom(client, msg.Payload)
+			case roomMessageTypeJoin:
+				s.forwardBuffered(client)
 			case roomMessageTypeLeave:
-				s.logger.Infof("one client left, room was deleted (room: %s, one: %s, other: %s)",
+				s.logger.Infof("one client unregistered, room was deleted (room: %s, one: %s, other: %s)",
 					client.roomID, msg.Sender, client.clientID)
 				return
 			}
@@ -196,42 +208,46 @@ func (s *Server) handle(conn *websocket.Conn) {
 	}
 }
 
-func (s *Server) joinRoom(client *clientProxy) (<-chan *roomMessage, error) {
+func (s *Server) register(client *clientProxy) (<-chan *roomMessage, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
 	defer cancel()
 
-	lock, err := s.roomManager.BeginRoomLock(ctx, client.roomID)
+	lock, err := s.roomManager.BeginRoomLock(client.roomID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin room lock: %w", err)
 	}
 
-	if len(lock.clientIDs) >= roomMaxMembers {
+	otherClientExists, err := s.roomManager.JoinRoom(ctx, client.roomID, client.clientID)
+	if err != nil {
 		lock.Unlock()
-		if err := s.writeJSON(client.conn, &RejectMessage{
-			Type:   MessageTypeReject,
-			Reason: "full",
-		}); err != nil {
-			return nil, fmt.Errorf("failed to send reject message: %w", err)
+		if errors.Is(err, errRoomIsFull) {
+			if err := s.writeJSON(client.conn, &RejectMessage{
+				Type:   MessageTypeReject,
+				Reason: "full",
+			}); err != nil {
+				return nil, fmt.Errorf("failed to send reject message: %w", err)
+			}
 		}
-		return nil, errRoomIsFull
+		return nil, err
 	}
-
-	onRoomMessage, err := s.roomManager.SubscribeMessage(client.roomID, client.clientID)
+	onRoomMessage, err := s.pubsubManager.Subscribe(client.roomID, client.clientID)
 	if err != nil {
 		lock.Unlock()
 		return nil, fmt.Errorf("failed to subscribe room: %w", err)
 	}
-
-	otherClientExists := len(lock.clientIDs) > 0
-	if err := s.roomManager.JoinRoom(ctx, client.roomID, client.clientID, otherClientExists); err != nil {
+	if err := s.forwarder.Forward(ctx, client.roomID, &roomMessage{
+		Sender: client.clientID,
+		Type:   roomMessageTypeJoin,
+	}, otherClientExists); err != nil {
 		lock.Unlock()
-		return nil, fmt.Errorf("failed to join room: %w", err)
+		return nil, fmt.Errorf("failed to publish join message: %w", err)
 	}
 	lock.Unlock()
+
 	if otherClientExists {
-		s.logger.Infof("client-two joined (room: %s, client: %s)", client.roomID, client.clientID)
+		s.logger.Infof("client-two registered (room: %s, client: %s)", client.roomID, client.clientID)
 	} else {
-		s.logger.Infof("client-one joined (room: %s, client: %s)", client.roomID, client.clientID)
+		s.logger.Infof("client-one registered (room: %s, client: %s)", client.roomID, client.clientID)
 	}
 
 	if err := s.writeJSON(client.conn, &AcceptMessage{
@@ -245,32 +261,29 @@ func (s *Server) joinRoom(client *clientProxy) (<-chan *roomMessage, error) {
 	return onRoomMessage, nil
 }
 
-func (s *Server) leaveRoom(client *clientProxy) {
+func (s *Server) unregister(client *clientProxy) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
 	defer cancel()
 
-	lock, err := s.roomManager.BeginRoomLock(ctx, client.roomID)
+	lock, err := s.roomManager.BeginRoomLock(client.roomID)
 	if err != nil {
 		s.logger.Errorf("failed to begin room lock (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
 		return
 	}
 	defer lock.Unlock()
 
-	exists, err := s.roomManager.roomExists(ctx, client.roomID)
+	otherClientExists, err := s.roomManager.LeaveRoom(ctx, client.roomID, client.clientID)
 	if err != nil {
-		s.logger.Errorf("failed to check room exists (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
-		return
+		s.logger.Errorf("failed to leave room (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
 	}
-	if exists {
-		if err := s.roomManager.UnsubscribeMessage(client.roomID, client.clientID); err != nil {
-			s.logger.Errorf("failed to unsubscribe (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
-		}
-		otherClientExists := len(lock.clientIDs) > 1
-		if err := s.roomManager.LeaveRoom(ctx, client.roomID, client.clientID, otherClientExists); err != nil {
-			s.logger.Errorf("failed to leave room (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
-		}
+	if err := s.forwarder.Forward(ctx, client.roomID, &roomMessage{
+		Sender: client.clientID,
+		Type:   roomMessageTypeLeave,
+	}, otherClientExists); err != nil {
+		s.logger.Errorf("failed to publish leave message (room: %s, client: %s): %+v", client.roomID, client.clientID, err)
 	}
-	s.logger.Infof("client left (room: %s, client: %s)", client.roomID, client.clientID)
+	s.pubsubManager.Unsubscribe(client.roomID, client.clientID)
+	s.logger.Infof("client unregistered (room: %s, client: %s)", client.roomID, client.clientID)
 }
 
 func (s *Server) authn(conn *websocket.Conn) (*clientProxy, error) {
@@ -305,7 +318,7 @@ func (s *Server) authn(conn *websocket.Conn) (*clientProxy, error) {
 		}
 		return nil, errUnauthenticated
 	}
-	s.logger.Debugf("client authenticated (room: %s, client: %s)", req.RoomID, req.ClientID)
+	s.logger.Infof("authenticated (room: %s, client: %s)", req.RoomID, req.ClientID)
 	return &clientProxy{
 		roomID:       req.RoomID,
 		clientID:     req.ClientID,
@@ -350,9 +363,6 @@ func (s *Server) shutdownConn(conn *websocket.Conn) {
 			s.logger.Errorf("failed to close websocket conn", err)
 		}
 	}
-	s.mu.Lock()
-	delete(s.conns, conn.RemoteAddr().String())
-	s.mu.Unlock()
 }
 
 func isClosedError(err error) bool {
@@ -437,12 +447,51 @@ func (s *Server) startReceive(client *clientProxy) (<-chan *PingPongMessage, <-c
 func (s *Server) forwardToRoom(sender *clientProxy, msg *message) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
 	defer cancel()
-	if err := s.roomManager.PublishMessage(ctx, sender.roomID, &roomMessage{
+
+	lock, err := s.roomManager.BeginRoomLock(sender.roomID)
+	if err != nil {
+		s.logger.Errorf("failed to begin room lock (room: %s): %+v", sender.roomID, err)
+		return
+	}
+	defer lock.Unlock()
+
+	numClients, err := s.roomManager.CountClients(ctx, sender.roomID)
+	if err != nil {
+		s.logger.Errorf("failed to count clients (room: %s): %+v", sender.roomID, err)
+		return
+	}
+	otherClientExists := numClients == roomMaxMembers
+
+	if err := s.forwarder.Forward(ctx, sender.roomID, &roomMessage{
 		Sender:  sender.clientID,
 		Type:    roomMessageTypeForward,
 		Payload: string(msg.Payload),
-	}); err != nil {
+	}, otherClientExists); err != nil {
 		s.logger.Errorf("failed to forward message to room (room: %s, client: %s): %+v",
+			sender.roomID, sender.clientID, err)
+	}
+}
+
+func (s *Server) forwardBuffered(sender *clientProxy) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
+	defer cancel()
+
+	lock, err := s.roomManager.BeginRoomLock(sender.roomID)
+	if err != nil {
+		s.logger.Errorf("failed to begin room lock (room: %s): %+v", sender.roomID, err)
+		return
+	}
+	defer lock.Unlock()
+
+	numClients, err := s.roomManager.CountClients(ctx, sender.roomID)
+	if err != nil {
+		s.logger.Errorf("failed to count clients (room: %s): %+v", sender.roomID, err)
+		return
+	}
+	otherClientExists := numClients == roomMaxMembers
+
+	if err := s.forwarder.ForwardBuffered(ctx, sender.roomID, otherClientExists); err != nil {
+		s.logger.Errorf("failed to forward buffered message to room (room: %s, client: %s): %+v",
 			sender.roomID, sender.clientID, err)
 	}
 }
