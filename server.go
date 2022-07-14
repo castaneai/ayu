@@ -21,10 +21,6 @@ const (
 	redisOperationTimeout = 10 * time.Second
 )
 
-var (
-	errUnauthenticated = errors.New("unauthenticated")
-)
-
 type clientProxy struct {
 	roomID       RoomID
 	clientID     ClientID
@@ -309,16 +305,21 @@ func (s *Server) authn(conn *websocket.Conn) (*clientProxy, error) {
 	defer cancel()
 	authnResponse, err := authn.Authenticate(ctx, req)
 	if err != nil {
+		_ = s.writeJSON(conn, &RejectMessage{
+			Type:   MessageTypeReject,
+			Reason: "InternalServerError",
+		})
 		return nil, fmt.Errorf("failed to authenticate: %w", err)
 	}
 	if !authnResponse.Allowed {
-		if err := s.writeJSON(conn, &RejectMessage{
+		// Although Ayame returns an InternalServerError, Ayu respects the Reason of the Authenticator.
+		// This is to distinguish between an InternalServerError and a denial of authentication.
+		// ref: https://github.com/OpenAyame/ayame/blob/9edb22807aca5a3c50d3b2444b370e5ee55012fd/connection.go#L332
+		_ = s.writeJSON(conn, &RejectMessage{
 			Type:   MessageTypeReject,
-			Reason: "InternalServerError",
-		}); err != nil {
-			return nil, fmt.Errorf("failed to send reject message: %w", err)
-		}
-		return nil, errUnauthenticated
+			Reason: authnResponse.Reason,
+		})
+		return nil, fmt.Errorf("unauthenticated (reason: %s)", authnResponse.Reason)
 	}
 	s.logger.Infof("authenticated (room: %s, client: %s)", req.RoomID, req.ClientID)
 	return &clientProxy{
