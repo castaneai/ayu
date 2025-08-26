@@ -1,8 +1,8 @@
 package ayu
 
 import (
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
+	"fmt"
+	"log/slog"
 )
 
 // Logger is a logger interface
@@ -13,12 +13,24 @@ type Logger interface {
 	Errorf(template string, args ...interface{})
 }
 
-func newDefaultLogger() (*zap.SugaredLogger, error) {
-	config := zap.NewDevelopmentConfig()
-	config.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
-	zapLogger, err := config.Build(zap.AddStacktrace(zap.FatalLevel))
-	if err != nil {
-		return nil, err
-	}
-	return zapLogger.Sugar(), nil
+type defaultLogger struct{}
+
+func (l *defaultLogger) Debugf(template string, args ...interface{}) {
+	slog.Debug(fmt.Sprintf(template, args...))
+}
+
+func (l *defaultLogger) Infof(template string, args ...interface{}) {
+	slog.Info(fmt.Sprintf(template, args...))
+}
+
+func (l *defaultLogger) Warnf(template string, args ...interface{}) {
+	slog.Warn(fmt.Sprintf(template, args...))
+}
+
+func (l *defaultLogger) Errorf(template string, args ...interface{}) {
+	slog.Error(fmt.Sprintf(template, args...))
+}
+
+func newDefaultLogger() *defaultLogger {
+	return &defaultLogger{}
 }
