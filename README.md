@@ -23,7 +23,7 @@ import (
 	"net/http"
 
 	"github.com/castaneai/ayu"
-	"github.com/go-redis/redis/v8"
+	"github.com/go-redis/redis/v9"
 )
 
 func main() {

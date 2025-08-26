@@ -12,8 +12,7 @@ import (
 func TestRedisPubSub(t *testing.T) {
 	rd := newTestRedisClient()
 	roomID := newRandomRoomID()
-	logger, err := newDefaultLogger()
-	assert.NoError(t, err)
+	logger := newDefaultLogger()
 	p, err := newRedisPubSub(rd, roomID, logger)
 	assert.NoError(t, err)
 

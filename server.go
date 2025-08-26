@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/websocket"
 )
 
@@ -85,7 +85,7 @@ func defaultServerOptions() *serverOptions {
 		pingInterval:   5 * time.Second,
 		pongTimeout:    60 * time.Second,
 		authn:          &insecureAuthenticator{},
-		logger:         nil,
+		logger:         newDefaultLogger(),
 		roomExpiration: 24 * time.Hour,
 	}
 }
@@ -108,13 +108,6 @@ func NewServer(redisClient *redis.Client, opts ...ServerOption) *Server {
 		opt.apply(dopts)
 	}
 	logger := dopts.logger
-	if logger == nil {
-		lg, err := newDefaultLogger()
-		if err != nil {
-			panic(err)
-		}
-		logger = lg
-	}
 	roomManager := newRedisRoomManager(redisClient, logger, dopts.roomExpiration)
 	pubsubManager := newRedisPubSubManager(redisClient, logger)
 	forwarder := newForwarder(pubsubManager, logger)
