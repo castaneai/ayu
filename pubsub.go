@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	subscriberChBufSize = 50
+	subscriberChBufSize = 200
 )
 
 func redisRoomPubSubKey(roomID RoomID) string {
