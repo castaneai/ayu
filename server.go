@@ -150,7 +150,10 @@ func (s *Server) handle(conn *websocket.Conn) {
 
 	client, err := s.authn(conn)
 	if err != nil {
-		s.logger.Errorf("failed to authenticate client: %+v", err)
+		var authnErr *authnError
+		if !errors.As(err, &authnErr) {
+			s.logger.Warnf("failed to authenticate: %+v", err)
+		}
 		return
 	}
 	s.mu.Lock()
@@ -277,9 +280,20 @@ func (s *Server) unregister(client *clientProxy) {
 	s.logger.Infof("client unregistered (room: %s, client: %s)", client.roomID, client.clientID)
 }
 
+type authnError struct {
+	Reason string
+}
+
+func (e *authnError) Error() string {
+	return fmt.Sprintf("unauthenticated (reason: %s)", e.Reason)
+}
+
 func (s *Server) authn(conn *websocket.Conn) (*clientProxy, error) {
 	regMsg, err := s.readRegisterMessage(conn)
 	if err != nil {
+		if isClosedError(err) {
+			return nil, &authnError{Reason: "ConnectionClosed"}
+		}
 		return nil, fmt.Errorf("failed to read register message: %w", err)
 	}
 	authn := s.opts.authn
@@ -302,7 +316,7 @@ func (s *Server) authn(conn *websocket.Conn) (*clientProxy, error) {
 			Type:   MessageTypeReject,
 			Reason: "InternalServerError",
 		})
-		return nil, fmt.Errorf("failed to authenticate: %w", err)
+		return nil, &authnError{Reason: fmt.Errorf("failed to call authenticator: %w", err).Error()}
 	}
 	if !authnResponse.Allowed {
 		// Although Ayame returns an InternalServerError, Ayu respects the Reason of the Authenticator.
@@ -312,7 +326,7 @@ func (s *Server) authn(conn *websocket.Conn) (*clientProxy, error) {
 			Type:   MessageTypeReject,
 			Reason: authnResponse.Reason,
 		})
-		return nil, fmt.Errorf("unauthenticated (reason: %s)", authnResponse.Reason)
+		return nil, &authnError{Reason: authnResponse.Reason}
 	}
 	s.logger.Infof("authenticated (room: %s, client: %s)", req.RoomID, req.ClientID)
 	return &clientProxy{
@@ -494,8 +508,10 @@ func (s *Server) forwardBuffered(sender *clientProxy) {
 
 func (s *Server) forwardFromRoom(receiver *clientProxy, payload string) {
 	if err := s.writeText(receiver.conn, payload); err != nil {
-		s.logger.Errorf("failed to forward message from room (room: %s, client: %s): %+v",
-			receiver.roomID, receiver.clientID, err)
+		if !isClosedError(err) {
+			s.logger.Errorf("failed to forward message from room (room: %s, client: %s): %+v",
+				receiver.roomID, receiver.clientID, err)
+		}
 	}
 }
 
